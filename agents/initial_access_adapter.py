@@ -213,9 +213,9 @@ def initial_access_agent_node(state: PipelineState) -> dict[str, Any]:
         }
 
     # ── Import and run the original ForensicAgent ─────────────────────────
-    # Import here to avoid circular dependency and allow agent.py to live
+    # Import here to avoid circular dependency and allow initial_access_agent.py to live
     # anywhere on the Python path.
-    from agent import ForensicAgent  # type: ignore
+    from initial_access_agent import ForensicAgent  # type: ignore
 
     work_dir = state.get("work_dir", "/tmp/sc4063")
     report_path = str(Path(work_dir) / "initial_access_report.md")
