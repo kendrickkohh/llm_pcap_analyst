@@ -103,6 +103,9 @@ def _extract_confirm_url(
     return None, None
 
 
+_MIN_PCAP_SIZE = 10_000  # 10 KB — any PCAP smaller than this is corrupt/HTML
+
+
 def download_file(
     url: str,
     filename: str,
@@ -112,14 +115,22 @@ def download_file(
 ) -> Path:
     """
     Download a file from a URL with Google Drive interstitial handling.
-    Skips download if the file already exists and is non-empty.
+    Skips download if the file already exists and passes size validation.
     """
     out_path = Path(out_dir) / filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if out_path.exists() and out_path.stat().st_size > 0:
-        print(f"  [cache] {filename} already downloaded — skipping.")
-        return out_path
+    is_pcap = filename.lower().endswith(".pcap")
+
+    # Cache check — also validates that PCAPs aren't tiny HTML error pages
+    if out_path.exists():
+        size = out_path.stat().st_size
+        if size > 0 and (not is_pcap or size > _MIN_PCAP_SIZE):
+            print(f"  [cache] {filename} already downloaded — skipping.")
+            return out_path
+        else:
+            print(f"  [cache] {filename} exists but looks corrupt ({size} B) — re-downloading.")
+            out_path.unlink()
 
     session = requests.Session()
     last_error: Optional[Exception] = None
@@ -132,6 +143,14 @@ def download_file(
 
             if _looks_like_html(response):
                 html = response.text
+
+                # Detect Google Drive quota/error pages
+                if "quota" in html.lower() or "can&#39;t view or download" in html.lower():
+                    raise RuntimeError(
+                        f"Google Drive quota exceeded for {filename}. "
+                        f"Try again later or use a different Google account."
+                    )
+
                 confirm_url, confirm_params = _extract_confirm_url(
                     html, response.url
                 )
@@ -144,6 +163,13 @@ def download_file(
                     confirm_url, params=confirm_params, stream=True, timeout=120
                 )
                 response.raise_for_status()
+
+                # Check again after confirm redirect
+                if _looks_like_html(response):
+                    error_text = response.text[:500]
+                    raise RuntimeError(
+                        f"Still received HTML after confirm redirect: {error_text[:200]}"
+                    )
 
             total = int(response.headers.get("content-length", 0))
             written = 0
@@ -166,6 +192,12 @@ def download_file(
             if total > 0 and written != total:
                 raise IOError(
                     f"Incomplete download: expected {total} B, got {written} B"
+                )
+
+            # Post-download validation for PCAPs
+            if is_pcap and written < _MIN_PCAP_SIZE:
+                raise RuntimeError(
+                    f"Downloaded PCAP is too small ({written} B) — likely an error page."
                 )
 
             print(f"  [dl] Saved → {out_path}")
@@ -429,25 +461,21 @@ def summarise_zeek_connections(
 # Two-phase ingestion: logs first, then smart PCAP selection
 # ──────────────────────────────────────────────────────────────────────────────
 
-def ingest_all_logs(
+def ingest_all_alerts(
     work_dir: str = "data",
-    zeek_datasets: Optional[list[str]] = None,
 ) -> dict[str, dict]:
     """
-    Phase 1: Download alerts + Zeek logs for ALL available days.
-    Returns {day: {"alerts_path": ..., "zeek_files": {...}}} for each day.
-    PCAPs are NOT downloaded yet.
+    Phase 1: Download ONLY Suricata alerts for ALL available days.
+    Zeek logs are deferred to Phase 3 (only for selected days).
+    Returns {day: {"alerts_path": ..., "zeek_files": {}}} for each day.
     """
-    from collections import Counter
-
-    datasets_to_fetch = zeek_datasets or PRIORITY_ZEEK_DATASETS
     days_meta = list_days()
     if not days_meta:
         raise RuntimeError("No days returned from API.")
 
     days = [d["day"] for d in days_meta]
     print(f"\n{'═' * 60}")
-    print(f"  Phase 1: Downloading logs for {len(days)} days")
+    print(f"  Phase 1: Downloading Suricata alerts for {len(days)} days")
     print(f"  Days: {days[0]} → {days[-1]}")
     print(f"{'═' * 60}\n")
 
@@ -457,18 +485,48 @@ def ingest_all_logs(
         day_dir = Path(work_dir) / day
         day_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n  [{i+1}/{len(days)}] {day}")
+        print(f"  [{i+1}/{len(days)}] {day}", end="")
 
-        # Alerts
         alerts_path: Optional[str] = None
         alerts_meta = get_alerts_metadata(day)
         if alerts_meta.get("downloadUrl"):
             p = download_file(alerts_meta["downloadUrl"], "alerts.ndjson", str(day_dir))
             alerts_path = str(p)
+            print(f"  ✓")
         else:
-            print(f"    [!] No alerts file for {day}")
+            print(f"  [!] No alerts file")
 
-        # Zeek datasets
+        all_logs[day] = {
+            "alerts_path": alerts_path,
+            "zeek_files": {},
+        }
+    print(f"\n  ✓ Phase 1 complete: alerts downloaded for {len(all_logs)} days")
+    return all_logs
+
+
+def download_zeek_for_days(
+    days: list[str],
+    work_dir: str = "data",
+    zeek_datasets: Optional[list[str]] = None,
+) -> dict[str, dict[str, str]]:
+    """
+    Phase 3b: Download Zeek logs only for the selected days.
+    Returns {day: {"zeek.connection.ndjson": "/path/...", ...}}
+    """
+    datasets_to_fetch = zeek_datasets or PRIORITY_ZEEK_DATASETS
+
+    print(f"\n{'═' * 60}")
+    print(f"  Phase 3b: Downloading Zeek logs for {len(days)} selected days")
+    print(f"{'═' * 60}")
+
+    result: dict[str, dict[str, str]] = {}
+
+    for i, day in enumerate(days):
+        day_dir = Path(work_dir) / day
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  [{i+1}/{len(days)}] {day}")
+
         zeek_files: dict[str, str] = {}
         available = {ds["name"]: ds for ds in list_zeek_datasets(day)}
         for name in datasets_to_fetch:
@@ -478,15 +536,11 @@ def ingest_all_logs(
             p = download_file(meta["downloadUrl"], name, str(day_dir / "zeek"))
             zeek_files[name] = str(p)
 
-        all_logs[day] = {
-            "alerts_path": alerts_path,
-            "zeek_files": zeek_files,
-        }
-        print(f"    ✓ alerts={'yes' if alerts_path else 'no'}, "
-              f"zeek={len(zeek_files)} files")
+        result[day] = zeek_files
+        print(f"    ✓ {len(zeek_files)} Zeek files")
 
-    print(f"\n  ✓ Phase 1 complete: logs downloaded for {len(all_logs)} days")
-    return all_logs
+    print(f"\n  ✓ Phase 3b complete: Zeek logs for {len(result)} days")
+    return result
 
 
 def score_alerts(
@@ -707,12 +761,15 @@ def download_selected_pcaps(
             print(f"\n  [{downloaded}/{total}] {day} PCAP[{idx}]: "
                   f"{chosen.get('name')} ({chosen.get('size', 0) / 1e6:.0f} MB)  "
                   f"score={entry['score']}")
-            p = download_file(
-                chosen["downloadUrl"],
-                chosen["name"],
-                str(day_dir),
-            )
-            day_paths.append(str(p))
+            try:
+                p = download_file(
+                    chosen["downloadUrl"],
+                    chosen["name"],
+                    str(day_dir),
+                )
+                day_paths.append(str(p))
+            except RuntimeError as exc:
+                print(f"  [!] Skipping {chosen.get('name')}: {exc}")
 
         result.setdefault(day, []).extend(day_paths)
 

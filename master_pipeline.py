@@ -61,10 +61,11 @@ from shared.data_contract import (          # noqa: E402
 from shared.pcap_api import (                           # noqa: E402
     ingest_day,
     list_days,
-    ingest_all_logs,
+    ingest_all_alerts,
     score_alerts,
     score_all_pcaps,
     download_selected_pcaps,
+    download_zeek_for_days,
 )
 
 from agents.initial_access_adapter import initial_access_agent_node    # noqa: E402
@@ -643,8 +644,8 @@ def run_all_days_pipeline(
     """
     from shared.data_contract import ZeekContext
 
-    # ── Phase 1: Download all logs ────────────────────────────────────────
-    all_logs = ingest_all_logs(work_dir=work_dir)
+    # ── Phase 1: Download alerts only (lightweight, ~600 MB) ────────────
+    all_logs = ingest_all_alerts(work_dir=work_dir)
 
     # ── Phase 2: Score alerts across all days ─────────────────────────────
     print(f"\n{'═' * 60}")
@@ -698,8 +699,16 @@ def run_all_days_pipeline(
     chosen_days = sorted(set(p["day"] for p in chosen_pcaps))
     print(f"\n  → Selected top {n_chosen} PCAPs ({chosen_mb:.0f} MB) across {len(chosen_days)} days")
 
-    # ── Phase 3: Download selected PCAPs ──────────────────────────────────
+    # ── Phase 3a: Download selected PCAPs ─────────────────────────────────
     pcap_paths = download_selected_pcaps(chosen_pcaps, work_dir=work_dir)
+
+    # ── Phase 3b: Download Zeek logs only for selected days ───────────────
+    zeek_by_day = download_zeek_for_days(chosen_days, work_dir=work_dir)
+
+    # Merge Zeek files into all_logs
+    for day, zeek_files in zeek_by_day.items():
+        if day in all_logs:
+            all_logs[day]["zeek_files"] = zeek_files
 
     # ── Phase 4: Run agent pipeline per day (only days with PCAPs) ───────
     all_day_results: list[dict] = []
