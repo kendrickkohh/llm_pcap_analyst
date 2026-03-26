@@ -285,7 +285,11 @@ class PipelineState(TypedDict, total=False):
     # ── Input ─────────────────────────────────────────────────────────────
     target_day: str                 # "YYYY-MM-DD" — the day to investigate
     pcap_file: str                  # resolved local path to the PCAP
+    pcap_files: list[str]           # all selected PCAPs for the day
     work_dir: str                   # scratch directory for downloads
+
+    # ── Alert scoring (populated by two-phase ingestion) ──────────────────
+    alert_scoring: dict[str, Any]   # output of score_alerts()
 
     # ── Zeek / API layer ──────────────────────────────────────────────────
     zeek_context: dict[str, Any]    # ZeekContext.to_dict() serialised
@@ -419,7 +423,7 @@ def merge_all_iocs(state: PipelineState) -> list[dict]:
 
 def initial_pipeline_state(
     target_day: str,
-    work_dir: str = "/tmp/sc4063",
+    work_dir: str = "data",
     run_id: Optional[str] = None,
 ) -> PipelineState:
     """Create a clean initial pipeline state."""
@@ -429,7 +433,9 @@ def initial_pipeline_state(
         started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         target_day=target_day,
         pcap_file="",
+        pcap_files=[],
         work_dir=work_dir,
+        alert_scoring={},
         zeek_context={},
         attack_context={},
         initial_access_findings={},

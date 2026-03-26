@@ -157,7 +157,7 @@ def exfiltration_agent_node(state: PipelineState) -> dict[str, Any]:
     if not pcap_path and zeek_ctx:
         pcap_path = zeek_ctx.pcap_path
 
-    work_dir  = state.get("work_dir", "/tmp/sc4063")
+    work_dir  = state.get("work_dir", "data")
     zeek_root = _prepare_zeek_root(zeek_ctx, work_dir)
 
     print("\n" + "─" * 60)

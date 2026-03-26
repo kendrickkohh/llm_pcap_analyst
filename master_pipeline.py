@@ -58,7 +58,14 @@ from shared.data_contract import (          # noqa: E402
     merge_all_iocs,
     set_zeek_context,
 )
-from shared.pcap_api import ingest_day, list_days      # noqa: E402
+from shared.pcap_api import (                           # noqa: E402
+    ingest_day,
+    list_days,
+    ingest_all_logs,
+    score_alerts,
+    score_all_pcaps,
+    download_selected_pcaps,
+)
 
 from agents.initial_access_adapter import initial_access_agent_node    # noqa: E402
 from agents.lateral_movement_adapter import lateral_movement_agent_node  # noqa: E402
@@ -152,7 +159,7 @@ def ingest_node(state: PipelineState) -> dict[str, Any]:
     Populates state["zeek_context"] and state["pcap_file"].
     """
     day = state["target_day"]
-    work_dir = state.get("work_dir", "/tmp/sc4063")
+    work_dir = state.get("work_dir", "data")
 
     print(f"\n{'═' * 60}")
     print(f"  [Ingest] Starting data collection for {day}")
@@ -499,14 +506,15 @@ Now write the complete incident report as Markdown.
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
 
-    # Save Markdown to work dir
-    work_dir = state.get("work_dir", "/tmp/sc4063")
-    md_path = Path(work_dir) / day / "incident_report.md"
-    md_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save both to project directory under reports/<run_id>/
+    run_id = state.get("run_id", "unknown")
+    run_dir = _REPO_ROOT / "reports" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    md_path = run_dir / f"incident_report_{day}.md"
     md_path.write_text(report_content, encoding="utf-8")
 
-    # Save PDF to project directory
-    pdf_path = _REPO_ROOT / "reports" / f"incident_report_{day}.pdf"
+    pdf_path = run_dir / f"incident_report_{day}.pdf"
     _save_pdf(pdf_path, report_content)
 
     print(f"\n  ✓ Markdown → {md_path}")
@@ -533,6 +541,7 @@ Now write the complete incident report as Markdown.
 def write_combined_report(
     all_day_results: list[dict],
     work_dir: str,
+    run_id: str = "unknown",
 ) -> str:
     """
     Call the LLM once with findings from all days to produce a single
@@ -602,10 +611,13 @@ def write_combined_report(
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
 
-    md_path = Path(work_dir) / "combined_incident_report.md"
+    run_dir = _REPO_ROOT / "reports" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    md_path = run_dir / "combined_incident_report.md"
     md_path.write_text(report_content, encoding="utf-8")
 
-    pdf_path = _REPO_ROOT / "reports" / "combined_incident_report.pdf"
+    pdf_path = run_dir / "combined_incident_report.pdf"
     _save_pdf(pdf_path, report_content)
 
     print(f"\n  ✓ Markdown → {md_path}")
@@ -619,34 +631,118 @@ def run_all_days_pipeline(
     work_dir: str,
 ) -> list[dict]:
     """
-    Fetch all available days from the API, run the analysis pipeline for each
-    day (skipping per-day report writing), and return accumulated per-day
-    findings for the final combined report.
+    Two-phase ingestion + human-in-the-loop PCAP selection + per-day analysis:
+
+    Phase 1: Download Zeek + Suricata logs for all days (lightweight)
+    Phase 2: Score alerts across all days, rank all PCAPs globally
+    HITL:    Present ranked PCAPs to user, user picks how many to ingest
+    Phase 3: Download chosen PCAPs
+    Phase 4: Run agent pipeline per day with pre-downloaded data
+
+    Returns accumulated per-day findings for the final combined report.
     """
-    days_meta = list_days()
-    if not days_meta:
-        raise RuntimeError("No days returned from API.")
+    from shared.data_contract import ZeekContext
 
-    days = [d["day"] for d in days_meta]
-    print(f"\n  [AllDays] Found {len(days)} days: {days[0]} … {days[-1]}")
+    # ── Phase 1: Download all logs ────────────────────────────────────────
+    all_logs = ingest_all_logs(work_dir=work_dir)
 
+    # ── Phase 2: Score alerts across all days ─────────────────────────────
+    print(f"\n{'═' * 60}")
+    print(f"  Phase 2: Scoring alerts across {len(all_logs)} days")
+    print(f"{'═' * 60}")
+    scoring = score_alerts(all_logs)
+
+    suspect_ips = scoring.get("suspect_ips", [])
+    print(f"\n  Top suspect IPs:")
+    for s in suspect_ips[:5]:
+        print(f"    {s['ip']:20s}  score={s['score']:6d}  "
+              f"({s['alert_count']} alerts)  {s['top_signatures'][0][:60]}")
+
+    # ── Phase 2b: Rank all PCAPs globally ─────────────────────────────────
+    print(f"\n{'═' * 60}")
+    print(f"  Phase 2b: Scoring all PCAPs across all days")
+    print(f"{'═' * 60}")
+    ranked_pcaps = score_all_pcaps(scoring)
+
+    if not ranked_pcaps:
+        raise RuntimeError("No PCAPs with suspect activity found across any day.")
+
+    # ── HITL: Present ranked PCAPs to user ────────────────────────────────
+    print(f"\n{'═' * 60}")
+    print(f"  Ranked PCAPs by suspect alert density ({len(ranked_pcaps)} with activity)")
+    print(f"{'═' * 60}")
+    print(f"  {'Rank':<6}{'Day':<14}{'PCAP':<8}{'Score':<10}{'Size':<10}{'Name'}")
+    print(f"  {'─'*6}{'─'*14}{'─'*8}{'─'*10}{'─'*10}{'─'*40}")
+    for i, p in enumerate(ranked_pcaps):
+        print(f"  {i+1:<6}{p['day']:<14}[{p['pcap_index']}]{'':<5}"
+              f"{p['score']:<10}{p['size_mb']:<10.0f}{p['pcap_name'][:40]}")
+
+    total_mb = sum(p["size_mb"] for p in ranked_pcaps)
+    print(f"\n  Total if all selected: {len(ranked_pcaps)} PCAPs, {total_mb:.0f} MB")
+
+    while True:
+        user_input = input(f"\n  How many PCAPs to ingest? (1-{len(ranked_pcaps)}, or 'all'): ").strip()
+        if user_input.lower() == "all":
+            n_chosen = len(ranked_pcaps)
+            break
+        try:
+            n_chosen = int(user_input)
+            if 1 <= n_chosen <= len(ranked_pcaps):
+                break
+            print(f"  Please enter a number between 1 and {len(ranked_pcaps)}.")
+        except ValueError:
+            print(f"  Please enter a number or 'all'.")
+
+    chosen_pcaps = ranked_pcaps[:n_chosen]
+    chosen_mb = sum(p["size_mb"] for p in chosen_pcaps)
+    chosen_days = sorted(set(p["day"] for p in chosen_pcaps))
+    print(f"\n  → Selected top {n_chosen} PCAPs ({chosen_mb:.0f} MB) across {len(chosen_days)} days")
+
+    # ── Phase 3: Download selected PCAPs ──────────────────────────────────
+    pcap_paths = download_selected_pcaps(chosen_pcaps, work_dir=work_dir)
+
+    # ── Phase 4: Run agent pipeline per day (only days with PCAPs) ───────
     all_day_results: list[dict] = []
+    days = sorted(pcap_paths.keys())
 
-    for day in days:
+    for i, day in enumerate(days):
         print(f"\n{'=' * 60}")
-        print(f"  [AllDays] Processing {day}  ({days.index(day)+1}/{len(days)})")
+        print(f"  [Phase 4] Agent analysis: {day}  ({i+1}/{len(days)})")
         print(f"{'=' * 60}")
 
-        state = initial_pipeline_state(target_day=day, work_dir=work_dir)
+        day_pcaps = pcap_paths.get(day, [])
+        day_logs = all_logs[day]
 
-        # Run pipeline — collect the last state snapshot that has agent findings
+        if not day_pcaps:
+            print(f"  [!] No PCAPs for {day} — skipping agent analysis")
+            continue
+
+        # Use the first selected PCAP as the primary (agents use pcap_file)
+        primary_pcap = day_pcaps[0]
+
+        # Build ZeekContext from pre-downloaded data
+        ctx = ZeekContext(
+            day=day,
+            pcap_path=primary_pcap,
+            alerts_path=day_logs.get("alerts_path"),
+            zeek_files=day_logs.get("zeek_files", {}),
+        )
+
+        # Create state with pre-populated ingestion data
+        state = initial_pipeline_state(target_day=day, work_dir=work_dir)
+        state.update(set_zeek_context(state, ctx))
+        state["pcap_file"] = primary_pcap
+        state["pcap_files"] = day_pcaps
+        state["alert_scoring"] = scoring
+        state["completed_agents"] = ["ingest"]  # skip ingest node
+
+        # Run the pipeline (ingest already done, starts at supervisor)
         final_day_state: dict[str, Any] = {}
         for step_state in pipeline.stream(state):
             node_name = list(step_state.keys())[0]
             node_data = step_state[node_name]
             completed = node_data.get("completed_agents", [])
             print(f"    ✓ {node_name}  |  completed: {completed}")
-            # Accumulate state (last writer wins, same as LangGraph reduce)
             final_day_state.update(node_data)
 
         all_day_results.append({
@@ -658,6 +754,11 @@ def run_all_days_pipeline(
             "payload_findings":           final_day_state.get("payload_findings", {}),
             "mitre_enrichment":           final_day_state.get("mitre_enrichment", {}),
             "iocs":                       merge_all_iocs(final_day_state),  # type: ignore[arg-type]
+            "pcap_files":                 day_pcaps,
+            "alert_scoring_summary": {
+                "suspect_ips": suspect_ips[:5],
+                "day_alerts": scoring.get("per_day", {}).get(day, {}).get("total_alerts", 0),
+            },
         })
 
     return all_day_results
@@ -757,8 +858,8 @@ Examples:
              "for each, then produce one combined incident report",
     )
     parser.add_argument(
-        "--work-dir", default="/tmp/sc4063",
-        help="Directory for downloads and outputs (default: /tmp/sc4063)",
+        "--work-dir", default=str(_REPO_ROOT / "data"),
+        help="Directory for downloads and outputs (default: ./data)",
     )
     parser.add_argument(
         "--pcap-index", type=int, default=0,
@@ -779,30 +880,37 @@ Examples:
 
     t_start = time.time()
 
-    # ── All-days mode ─────────────────────────────────────────────────────
+    # ── All-days mode (two-phase ingestion + HITL) ──────────────────────
     if args.all_days:
         print(f"\n{'=' * 60}")
         print(f"  SC4063 Security Analysis Pipeline — ALL DAYS")
         print(f"  Work dir: {args.work_dir}")
         print(f"{'=' * 60}\n")
 
+        import uuid
+        run_id = str(uuid.uuid4())[:8]
+
+        print(f"  Run ID : {run_id}")
+
         # Build pipeline without per-day report writing
         pipeline = build_pipeline(skip_report=True)
 
         all_day_results = run_all_days_pipeline(pipeline, args.work_dir)
 
-        combined_report = write_combined_report(all_day_results, args.work_dir)
+        combined_report = write_combined_report(
+            all_day_results, args.work_dir, run_id=run_id
+        )
 
         elapsed = time.time() - t_start
-        pdf_path = _REPO_ROOT / "reports" / "combined_incident_report.pdf"
+        run_dir = _REPO_ROOT / "reports" / run_id
         print(f"\n{'=' * 60}")
         print(f"  All-days pipeline complete in {elapsed:.0f}s")
         print(f"  Days processed : {len(all_day_results)}")
-        print(f"  PDF report     : {pdf_path}")
+        print(f"  Reports        : {run_dir}")
         print(f"{'=' * 60}\n")
         print(combined_report[:3000])
         if len(combined_report) > 3000:
-            print(f"\n  … [truncated — see PDF for full report]")
+            print(f"\n  … [truncated — see {run_dir} for full report]")
         return
 
     # ── Single-day mode ───────────────────────────────────────────────────
@@ -864,12 +972,12 @@ Examples:
     print(f"{'=' * 60}\n")
 
     if final_state and final_state.get("final_report"):
-        pdf_path = _REPO_ROOT / "reports" / f"incident_report_{args.day}.pdf"
-        print(f"  PDF report: {pdf_path}")
+        run_dir = _REPO_ROOT / "reports" / state["run_id"]
+        print(f"  Reports: {run_dir}")
         print(f"\n{'─' * 60}")
         print(final_state["final_report"][:3000])
         if len(final_state["final_report"]) > 3000:
-            print(f"\n  … [truncated — see PDF for full report]")
+            print(f"\n  … [truncated — see {run_dir} for full report]")
 
 
 if __name__ == "__main__":

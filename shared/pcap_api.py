@@ -233,7 +233,7 @@ def get_file_metadata(file_id: str) -> dict:
 
 def ingest_day(
     day: str,
-    work_dir: str = "/tmp/sc4063",
+    work_dir: str = "data",
     zeek_datasets: Optional[list[str]] = None,
     pcap_index: int = 0,
     skip_zeek: bool = False,
@@ -423,3 +423,298 @@ def summarise_zeek_connections(
         "top_ports": port_counter.most_common(top_n),
         "protocols": dict(proto_counter),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Two-phase ingestion: logs first, then smart PCAP selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ingest_all_logs(
+    work_dir: str = "data",
+    zeek_datasets: Optional[list[str]] = None,
+) -> dict[str, dict]:
+    """
+    Phase 1: Download alerts + Zeek logs for ALL available days.
+    Returns {day: {"alerts_path": ..., "zeek_files": {...}}} for each day.
+    PCAPs are NOT downloaded yet.
+    """
+    from collections import Counter
+
+    datasets_to_fetch = zeek_datasets or PRIORITY_ZEEK_DATASETS
+    days_meta = list_days()
+    if not days_meta:
+        raise RuntimeError("No days returned from API.")
+
+    days = [d["day"] for d in days_meta]
+    print(f"\n{'═' * 60}")
+    print(f"  Phase 1: Downloading logs for {len(days)} days")
+    print(f"  Days: {days[0]} → {days[-1]}")
+    print(f"{'═' * 60}\n")
+
+    all_logs: dict[str, dict] = {}
+
+    for i, day in enumerate(days):
+        day_dir = Path(work_dir) / day
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  [{i+1}/{len(days)}] {day}")
+
+        # Alerts
+        alerts_path: Optional[str] = None
+        alerts_meta = get_alerts_metadata(day)
+        if alerts_meta.get("downloadUrl"):
+            p = download_file(alerts_meta["downloadUrl"], "alerts.ndjson", str(day_dir))
+            alerts_path = str(p)
+        else:
+            print(f"    [!] No alerts file for {day}")
+
+        # Zeek datasets
+        zeek_files: dict[str, str] = {}
+        available = {ds["name"]: ds for ds in list_zeek_datasets(day)}
+        for name in datasets_to_fetch:
+            if name not in available:
+                continue
+            meta = available[name]
+            p = download_file(meta["downloadUrl"], name, str(day_dir / "zeek"))
+            zeek_files[name] = str(p)
+
+        all_logs[day] = {
+            "alerts_path": alerts_path,
+            "zeek_files": zeek_files,
+        }
+        print(f"    ✓ alerts={'yes' if alerts_path else 'no'}, "
+              f"zeek={len(zeek_files)} files")
+
+    print(f"\n  ✓ Phase 1 complete: logs downloaded for {len(all_logs)} days")
+    return all_logs
+
+
+def score_alerts(
+    all_logs: dict[str, dict],
+    top_n_ips: int = 10,
+) -> dict[str, Any]:
+    """
+    Analyse Suricata alerts across all days.
+    Returns a scoring summary with top suspect IPs and per-day per-hour
+    alert density for PCAP selection.
+
+    Returns:
+        {
+            "suspect_ips": [{"ip": ..., "score": ..., "alert_count": ..., "signatures": [...]}, ...],
+            "per_day": {
+                "2025-03-01": {
+                    "total_alerts": ...,
+                    "hourly_density": {"2025-03-01T18": count, ...},
+                    "suspect_hourly": {"2025-03-01T18": count, ...},
+                }
+            }
+        }
+    """
+    from collections import Counter
+
+    # Accumulate across all days
+    ip_scores: dict[str, int] = {}
+    ip_counts: Counter = Counter()
+    ip_signatures: dict[str, Counter] = {}
+    per_day: dict[str, dict] = {}
+
+    for day, logs in sorted(all_logs.items()):
+        alerts_path = logs.get("alerts_path")
+        if not alerts_path or not Path(alerts_path).exists():
+            per_day[day] = {"total_alerts": 0, "hourly_density": {}, "suspect_hourly": {}}
+            continue
+
+        hourly: Counter = Counter()
+        day_count = 0
+
+        with open(alerts_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    a = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                day_count += 1
+                ip = a.get("source", {}).get("ip", "")
+                sev = a.get("event", {}).get("severity", 3)
+                sig = a.get("rule", {}).get("name", "")
+                ts = a.get("@timestamp", "")[:13]  # "YYYY-MM-DDTHH"
+
+                # Score: severity 1 = 3 pts, 2 = 2 pts, 3 = 1 pt
+                score = max(1, 4 - sev)
+                ip_scores[ip] = ip_scores.get(ip, 0) + score
+                ip_counts[ip] += 1
+
+                if ip not in ip_signatures:
+                    ip_signatures[ip] = Counter()
+                ip_signatures[ip][sig] += 1
+
+                if ts:
+                    hourly[ts] += 1
+
+        per_day[day] = {
+            "total_alerts": day_count,
+            "hourly_density": dict(sorted(hourly.items())),
+        }
+
+    # Rank IPs by score
+    ranked = sorted(ip_scores.items(), key=lambda x: -x[1])[:top_n_ips]
+    suspect_ips = []
+    suspect_ip_set = set()
+    for ip, score in ranked:
+        suspect_ip_set.add(ip)
+        top_sigs = [sig for sig, _ in ip_signatures.get(ip, Counter()).most_common(5)]
+        suspect_ips.append({
+            "ip": ip,
+            "score": score,
+            "alert_count": ip_counts[ip],
+            "top_signatures": top_sigs,
+        })
+
+    # Re-scan to build suspect-IP hourly density per day
+    for day, logs in sorted(all_logs.items()):
+        alerts_path = logs.get("alerts_path")
+        if not alerts_path or not Path(alerts_path).exists():
+            per_day[day]["suspect_hourly"] = {}
+            continue
+
+        suspect_hourly: Counter = Counter()
+        with open(alerts_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    a = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ip = a.get("source", {}).get("ip", "")
+                ts = a.get("@timestamp", "")[:13]
+                if ip in suspect_ip_set and ts:
+                    suspect_hourly[ts] += 1
+
+        per_day[day]["suspect_hourly"] = dict(sorted(suspect_hourly.items()))
+
+    return {
+        "suspect_ips": suspect_ips,
+        "per_day": per_day,
+    }
+
+
+def score_all_pcaps(
+    scoring: dict[str, Any],
+) -> list[dict]:
+    """
+    Phase 2: Score every PCAP across all days by suspect-IP alert density.
+
+    Returns a globally ranked list (highest score first):
+    [
+        {"day": "2025-03-01", "pcap_index": 2, "pcap_name": "...", "score": 1450, "size_mb": 396.7},
+        {"day": "2025-03-01", "pcap_index": 5, "pcap_name": "...", "score": 1100, "size_mb": 330.4},
+        ...
+    ]
+
+    PCAPs with score 0 are excluded.
+    """
+    per_day = scoring.get("per_day", {})
+    all_scored: list[dict] = []
+
+    for day in sorted(per_day.keys()):
+        day_info = per_day[day]
+        suspect_hourly = day_info.get("suspect_hourly", {})
+
+        pcaps = list_pcaps(day)
+        if not pcaps:
+            continue
+        n_pcaps = len(pcaps)
+
+        if not suspect_hourly:
+            continue
+
+        hours = sorted(suspect_hourly.keys())
+        if not hours:
+            continue
+
+        # Map hours to PCAP buckets proportionally
+        bucket_scores: dict[int, int] = {}
+        for i, hour in enumerate(hours):
+            pcap_idx = min(int(i * n_pcaps / len(hours)), n_pcaps - 1)
+            bucket_scores[pcap_idx] = bucket_scores.get(pcap_idx, 0) + suspect_hourly[hour]
+
+        for pcap_idx, pcap_score in bucket_scores.items():
+            if pcap_score <= 0:
+                continue
+            pcap_meta = pcaps[pcap_idx]
+            all_scored.append({
+                "day": day,
+                "pcap_index": pcap_idx,
+                "pcap_name": pcap_meta.get("name", ""),
+                "score": pcap_score,
+                "size_mb": round(pcap_meta.get("size", 0) / 1e6, 1),
+            })
+
+    # Sort globally by score descending
+    all_scored.sort(key=lambda x: -x["score"])
+    return all_scored
+
+
+def download_selected_pcaps(
+    chosen_pcaps: list[dict],
+    work_dir: str = "data",
+) -> dict[str, list[str]]:
+    """
+    Phase 3: Download PCAPs from the chosen list.
+
+    Parameters
+    ----------
+    chosen_pcaps : list of dicts from score_all_pcaps(), each with
+                   "day", "pcap_index", "pcap_name", "score", "size_mb"
+    work_dir     : scratch directory
+
+    Returns: {"2025-03-01": ["/tmp/.../pcap1.pcap"], ...}
+    """
+    result: dict[str, list[str]] = {}
+    total = len(chosen_pcaps)
+
+    total_mb = sum(p.get("size_mb", 0) for p in chosen_pcaps)
+    print(f"\n{'═' * 60}")
+    print(f"  Phase 3: Downloading {total} selected PCAPs ({total_mb:.0f} MB)")
+    print(f"{'═' * 60}")
+
+    # Group by day to batch API calls
+    by_day: dict[str, list[dict]] = {}
+    for p in chosen_pcaps:
+        by_day.setdefault(p["day"], []).append(p)
+
+    downloaded = 0
+    for day in sorted(by_day.keys()):
+        pcap_list = list_pcaps(day)
+        if not pcap_list:
+            print(f"  [!] No PCAPs available for {day}")
+            result[day] = []
+            continue
+
+        day_dir = Path(work_dir) / day / "pcap"
+        day_paths: list[str] = []
+
+        for entry in by_day[day]:
+            idx = entry["pcap_index"]
+            chosen = pcap_list[min(idx, len(pcap_list) - 1)]
+            downloaded += 1
+            print(f"\n  [{downloaded}/{total}] {day} PCAP[{idx}]: "
+                  f"{chosen.get('name')} ({chosen.get('size', 0) / 1e6:.0f} MB)  "
+                  f"score={entry['score']}")
+            p = download_file(
+                chosen["downloadUrl"],
+                chosen["name"],
+                str(day_dir),
+            )
+            day_paths.append(str(p))
+
+        result.setdefault(day, []).extend(day_paths)
+
+    print(f"\n  ✓ Phase 3 complete: {downloaded} PCAPs downloaded")
+    return result

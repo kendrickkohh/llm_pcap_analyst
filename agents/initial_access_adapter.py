@@ -217,7 +217,7 @@ def initial_access_agent_node(state: PipelineState) -> dict[str, Any]:
     # anywhere on the Python path.
     from initial_access_agent import ForensicAgent  # type: ignore
 
-    work_dir = state.get("work_dir", "/tmp/sc4063")
+    work_dir = state.get("work_dir", "data")
     report_path = str(Path(work_dir) / "initial_access_report.md")
 
     azure_config = {
