@@ -1,56 +1,60 @@
 # SC4063 Security Analysis Pipeline
 
-Autonomous multi-agent PCAP forensics pipeline built on LangGraph.
+Autonomous multi-agent PCAP forensics pipeline built on LangGraph. Analyses network captures across multiple days, maps findings to MITRE ATT&CK, identifies candidate threat groups, and produces a PDF incident report.
 
 ---
 
-## Architecture
+## Pipeline Flow
 
 ```
-                    ┌─────────────────────────────────┐
-                    │          master_pipeline.py       │
-                    │        (LangGraph orchestrator)   │
-                    └─────────────────────────────────┘
-                                     │
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │           ingest_node             │
-                    │  shared/pcap_api.py               │
-                    │  • API: days / alerts / zeek_datasets / pcaps
-                    │  • Downloads alerts.ndjson        │
-                    │  • Downloads Zeek NDJSON logs     │
-                    │  • Downloads PCAP                 │
-                    │  • Returns ZeekContext            │
-                    └────────────────┬────────────────┘
-                                     │
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │          supervisor_node           │
-                    │  Routes to next unrun agent       │
-                    │  Uses deterministic order:        │
-                    │  initial_access → lateral_movement│
-                    │  → exfiltration → payload → FINISH│
-                    └────────────────┬────────────────┘
-                         ┌───────────┼───────────┐───────────┐
-                         ▼           ▼           ▼           ▼
-              ┌──────────────┐ ┌──────────┐ ┌────────┐ ┌────────┐
-              │ InitialAccess│ │ Lateral  │ │ Exfil  │ │Payload │
-              │  adapter     │ │Movement  │ │ agent  │ │adapter │
-              │  (agent.py)  │ │ adapter  │ │        │ │        │
-              │  ForensicAgent│ │(lateral_ │ │(new,   │ │payload_│
-              │  Azure GPT-4o│ │movement) │ │Zeek+   │ │agent.py│
-              │  tshark tools│ │Azure LLM │ │tshark) │ │Ollama  │
-              └──────┬───────┘ └────┬─────┘ └───┬────┘ └───┬────┘
-                     │              │            │          │
-                     └──────────────┴────────────┴──────────┘
-                                     │ (all loop back to supervisor)
-                                     ▼
-                    ┌─────────────────────────────────┐
-                    │        report_writing_node        │
-                    │  Ollama llama3.2                  │
-                    │  Synthesises all findings into    │
-                    │  a Markdown incident report       │
-                    └─────────────────────────────────┘
+ingest → supervisor → agents (loop) → supervisor → mitre_enrichment → report_writing → END
+```
+
+```
+┌─────────────────────────────────────┐
+│          master_pipeline.py          │
+│        (LangGraph orchestrator)      │
+└──────────────┬──────────────────────┘
+               ▼
+┌─────────────────────────────────────┐
+│            ingest_node               │
+│  shared/pcap_api.py                  │
+│  • Fetches alerts, Zeek logs, PCAP   │
+│  • Returns ZeekContext               │
+└──────────────┬──────────────────────┘
+               ▼
+┌─────────────────────────────────────┐
+│          supervisor_node             │
+│  Deterministic routing:             │
+│  initial_access → lateral_movement  │
+│  → exfiltration → payload → FINISH  │
+└──────────────┬──────────────────────┘
+    ┌──────────┼──────────┬───────────┐
+    ▼          ▼          ▼           ▼
+┌────────┐┌────────┐┌────────┐┌──────────┐
+│Initial ││Lateral ││ Exfil  ││ Payload  │
+│Access  ││Movement││ Agent  ││ Agent    │
+│        ││        ││        ││          │
+│Azure   ││Azure   ││Zeek +  ││Ollama    │
+│GPT-4o  ││LLM     ││tshark  ││          │
+└───┬────┘└───┬────┘└───┬────┘└────┬─────┘
+    └─────────┴─────────┴──────────┘
+               │ (all loop back to supervisor)
+               ▼
+┌─────────────────────────────────────┐
+│       mitre_enrichment_node          │
+│  • Loads enterprise-attack.json      │
+│  • Maps findings → ATT&CK techniques│
+│  • Identifies candidate threat groups│
+└──────────────┬──────────────────────┘
+               ▼
+┌─────────────────────────────────────┐
+│        report_writing_node           │
+│  Azure GPT-4o                        │
+│  • MITRE-enriched system prompt      │
+│  • Anti-hallucination constraints    │
+│  • Outputs PDF to reports/           │
+└─────────────────────────────────────┘
 ```
 
 ---
@@ -58,125 +62,47 @@ Autonomous multi-agent PCAP forensics pipeline built on LangGraph.
 ## Directory Structure
 
 ```
-pipeline/
-├── master_pipeline.py          # Orchestrator — run this
+SC4063_project/
+├── master_pipeline.py              # Orchestrator — run this
+├── agent.py                        # InitialAccess ForensicAgent
+├── payload_agent.py                # Payload agent
+├── requirements.txt
+├── .env                            # API keys (not committed)
 │
 ├── shared/
-│   ├── data_contract.py        # ★ Canonical data types & state schema
-│   └── pcap_api.py             # SC4063 API client + Zeek streaming helpers
+│   ├── data_contract.py            # Canonical data types & state schema
+│   └── pcap_api.py                 # SC4063 API client + Zeek helpers
 │
-└── agents/
-    ├── initial_access_adapter.py    # Wraps agent.py → PipelineState
-    ├── lateral_movement_adapter.py  # Wraps lateral_movement.py → PipelineState
-    ├── exfiltration_agent.py        # New Zeek-aware exfiltration agent
-    └── payload_agent_adapter.py     # Wraps payload_agent.py → PipelineState
-```
-
-Place your existing files alongside `pipeline/`:
-```
-project_root/
-├── agent.py                    # InitialAccess ForensicAgent (unchanged)
+├── agents/
+│   ├── initial_access_adapter.py   # Wraps agent.py → PipelineState
+│   ├── lateral_movement_adapter.py # Wraps lateral_movement.py → PipelineState
+│   ├── exfiltration_agent.py       # Zeek-aware exfiltration agent
+│   └── payload_agent_adapter.py    # Wraps payload_agent.py → PipelineState
+│
 ├── lateral_movement/
-│   └── lateral_movement.py     # LateralMovement agent (unchanged)
-├── payload_agent.py            # Payload agent (unchanged)
-├── exfiltration_agent.py       # Your exfiltration module (if exists)
+│   └── lateral_movement.py         # Lateral movement agent
 │
-└── pipeline/                   # ← this folder
-    ├── master_pipeline.py
-    ├── shared/
-    └── agents/
+├── mitre_reference/
+│   └── enterprise-attack.json      # MITRE ATT&CK STIX bundle (used by enrichment)
+│
+└── reports/                        # Generated PDF reports (output)
 ```
 
 ---
 
-## Data Contract (the key design decision)
-
-Every agent reads from and writes to `PipelineState` — a single
-`TypedDict` defined in `shared/data_contract.py`.  No agent invents
-its own inter-agent dict keys.
-
-### PipelineState keys
-
-| Key | Type | Written by | Read by |
-|---|---|---|---|
-| `target_day` | `str` | caller | ingest |
-| `pcap_file` | `str` | ingest | all agents |
-| `zeek_context` | `ZeekContext` dict | ingest | all agents |
-| `attack_context` | `dict` | all agents (accumulate) | all agents |
-| `initial_access_findings` | `InitialAccessFindings` dict | initial_access | supervisor, report |
-| `lateral_movement_findings` | `LateralMovementFindings` dict | lateral_movement | supervisor, report |
-| `exfiltration_findings` | `ExfiltrationFindings` dict | exfiltration | supervisor, report |
-| `payload_findings` | `PayloadFindings` dict | payload | supervisor, report |
-| `final_report` | `str` | report_writing | caller |
-| `completed_agents` | `list[str]` | each agent | supervisor |
-
-### ZeekContext
-
-```python
-ZeekContext(
-    day="2025-03-06",
-    pcap_path="/tmp/sc4063/2025-03-06/pcap/capture.pcap",
-    alerts_path="/tmp/sc4063/2025-03-06/alerts.ndjson",
-    zeek_files={
-        "zeek.dns.ndjson": "/tmp/sc4063/2025-03-06/zeek/zeek.dns.ndjson",
-        "zeek.connection.ndjson": "...",
-        ...
-    }
-)
-```
-
-Each agent accesses Zeek logs through `get_zeek_context(state).zeek_files["zeek.dns.ndjson"]`.
-
-### Shared attack_context
-
-All agents read and write `state["attack_context"]` to share running
-facts about the incident.  Canonical keys:
-
-```python
-{
-    "patient_zero": "10.0.0.50",
-    "attacker_ips": ["1.2.3.4"],
-    "compromised_hosts": ["10.0.0.50", "10.0.0.100"],
-    "techniques": ["smb_file_transfer"],
-    "exfil_destinations": ["5.6.7.8"],
-    "malicious_hashes": ["abc123..."],
-    "timeline_events": [...]
-}
-```
-
----
-
-## IOC propagation
-
-Each agent produces `IOC` objects attached to its findings:
-
-```python
-@dataclass
-class IOC:
-    ioc_type: Literal["ip", "domain", "hash", "port", "file", "url", "user"]
-    value: str
-    source_agent: str
-    confidence: Literal["high", "medium", "low"]
-    notes: str
-```
-
-`merge_all_iocs(state)` collects and deduplicates IOCs from all agents
-for the final report.
-
----
-
-## Quick Start
+## Setup
 
 ### 1. Install dependencies
+
 ```bash
-pip install langchain langgraph langchain-ollama langchain-openai \
-            langchain-core python-dotenv requests tqdm
-# Ensure Ollama is running: ollama pull llama3.2
+pip install -r requirements.txt
 ```
 
 ### 2. Set environment variables
+
+Create a `.env` file in the project root:
+
 ```bash
-# .env
 AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
 AZURE_OPENAI_API_KEY=<key>
 AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
@@ -185,48 +111,64 @@ TSHARK_PATH=/usr/bin/tshark   # optional — auto-detected
 ```
 
 ### 3. Run the pipeline
+
 ```bash
-cd pipeline
+# Single day
 python master_pipeline.py --day 2025-03-06
+
+# All available days (combined report)
+python master_pipeline.py --all-days
+
+# Custom work directory
+python master_pipeline.py --all-days --work-dir ./data
 ```
 
 ### 4. Debug a single agent
+
 ```bash
-# Test just the exfiltration agent with an already-downloaded PCAP
 python master_pipeline.py --day 2025-03-06 \
     --pcap /tmp/sc4063/2025-03-06/pcap/capture.pcap \
     --only exfiltration
 ```
 
----
+### 5. Output
 
-## API Flow (from notebook)
+Reports are saved to the `reports/` directory in the project root:
 
-```
-days → alerts (optional) → zeek_datasets → zeek_file → pcaps → file/download
-```
+- Single day: `reports/incident_report_YYYY-MM-DD.pdf`
+- All days: `reports/combined_incident_report.pdf`
 
-The `ingest_node` runs this automatically.  Downloaded artifacts are
-cached — re-running the pipeline skips files already on disk.
+Markdown copies are also saved to the work directory (`/tmp/sc4063/` by default).
 
 ---
 
-## Adding a New Agent
+## Data Contract
 
-1. Create `agents/my_agent.py` with a function:
-   ```python
-   def my_agent_node(state: PipelineState) -> dict[str, Any]:
-       ...
-       findings = MyFindings(...)
-       return {**state, "my_findings": findings.to_dict(), ...}
-   ```
+All agents read from and write to `PipelineState` (defined in `shared/data_contract.py`).
 
-2. Add a findings dataclass to `shared/data_contract.py`.
+| Key | Type | Written by | Read by |
+|---|---|---|---|
+| `target_day` | `str` | caller | ingest |
+| `pcap_file` | `str` | ingest | all agents |
+| `zeek_context` | `ZeekContext` | ingest | all agents |
+| `attack_context` | `dict` | all agents | all agents |
+| `initial_access_findings` | `dict` | initial_access | supervisor, report |
+| `lateral_movement_findings` | `dict` | lateral_movement | supervisor, report |
+| `exfiltration_findings` | `dict` | exfiltration | supervisor, report |
+| `payload_findings` | `dict` | payload | supervisor, report |
+| `mitre_enrichment` | `dict` | mitre_enrichment | report_writing |
+| `final_report` | `str` | report_writing | caller |
+| `completed_agents` | `list[str]` | each node | supervisor |
 
-3. Register the node in `master_pipeline.py`:
-   ```python
-   workflow.add_node("my_agent", my_agent_node)
-   workflow.add_edge("my_agent", "supervisor")
-   ```
+---
 
-4. Add `"my_agent"` to `_AGENT_ORDER` in `master_pipeline.py`.
+## MITRE ATT&CK Enrichment
+
+The `mitre_enrichment_node` loads `mitre_reference/enterprise-attack.json` (STIX 2.0 bundle) and:
+
+1. Extracts behavioural keywords from all agent findings
+2. Maps them to ATT&CK technique IDs (e.g. RDP -> T1021.001, SMB -> T1021.002)
+3. Finds threat groups that use >=2 of the matched techniques
+4. Passes enriched data (techniques + candidate groups) to the report writer
+
+The report writer uses this to produce MITRE-mapped findings and threat group assessments.

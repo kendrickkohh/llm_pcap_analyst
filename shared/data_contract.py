@@ -301,6 +301,10 @@ class PipelineState(TypedDict, total=False):
     exfiltration_findings: dict[str, Any]
     payload_findings: dict[str, Any]
 
+    # ── MITRE ATT&CK enrichment ───────────────────────────────────────────
+    mitre_enrichment: dict[str, Any]
+    # Keys: "matched_techniques", "candidate_threat_groups", "technique_ids"
+
     # ── Report output ─────────────────────────────────────────────────────
     final_report: str
 
@@ -432,6 +436,7 @@ def initial_pipeline_state(
         lateral_movement_findings={},
         exfiltration_findings={},
         payload_findings={},
+        mitre_enrichment={},
         final_report="",
         next_agent="ingest",
         completed_agents=[],

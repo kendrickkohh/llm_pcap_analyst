@@ -67,6 +67,82 @@ from agents.payload_agent_adapter import payload_agent_node             # noqa: 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# MITRE ATT&CK data loading (lazy, cached)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MITRE_JSON_PATH = _REPO_ROOT / "mitre_reference" / "enterprise-attack.json"
+_MITRE_BY_ATTACK_ID: dict[str, dict] = {}
+_MITRE_BY_STIX_ID: dict[str, dict] = {}
+_MITRE_GROUP_TECH_MAP: dict[str, list[str]] = {}
+_MITRE_LOADED = False
+
+
+def _load_mitre() -> None:
+    global _MITRE_LOADED
+    if _MITRE_LOADED:
+        return
+    print("  [MITRE] Loading enterprise-attack.json…")
+    with open(_MITRE_JSON_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    objects = data["objects"]
+    _MITRE_BY_STIX_ID.update({o["id"]: o for o in objects})
+    for o in objects:
+        if o.get("type") == "attack-pattern":
+            for ref in o.get("external_references", []):
+                if ref.get("source_name") == "mitre-attack" and ref.get("external_id"):
+                    _MITRE_BY_ATTACK_ID[ref["external_id"]] = o
+    for o in objects:
+        if (o.get("type") == "relationship"
+                and o.get("relationship_type") == "uses"
+                and o.get("source_ref", "").startswith("intrusion-set")
+                and o.get("target_ref", "").startswith("attack-pattern")):
+            _MITRE_GROUP_TECH_MAP.setdefault(o["source_ref"], []).append(o["target_ref"])
+    _MITRE_LOADED = True
+    print(f"  [MITRE] Loaded {len(_MITRE_BY_ATTACK_ID)} techniques, "
+          f"{len(_MITRE_GROUP_TECH_MAP)} threat groups")
+
+
+_KEYWORD_TO_TECHNIQUE_IDS: dict[str, list[str]] = {
+    "rdp": ["T1021.001", "T1110.001"],
+    "remote desktop": ["T1021.001"],
+    "brute": ["T1110", "T1110.001"],
+    "password": ["T1110", "T1078"],
+    "credential": ["T1003", "T1110"],
+    "smb": ["T1021.002", "T1570"],
+    "smb_file": ["T1021.002", "T1570"],
+    "dce_rpc": ["T1021.003"],
+    "rpc": ["T1021.003"],
+    "ntlm": ["T1187", "T1550.002"],
+    "kerberos": ["T1558"],
+    "dns": ["T1071.004"],
+    "http": ["T1071.001", "T1048.003"],
+    "https": ["T1071.001"],
+    "exfil": ["T1041", "T1048"],
+    "exfiltration": ["T1041", "T1048"],
+    "temp.sh": ["T1567.002", "T1048"],
+    "upload": ["T1048", "T1567"],
+    "7zip": ["T1560.001"],
+    "7-zip": ["T1560.001"],
+    "compress": ["T1560"],
+    "archive": ["T1560"],
+    "scan": ["T1046"],
+    "discovery": ["T1046", "T1018"],
+    "file transfer": ["T1105"],
+    "download": ["T1105"],
+    "payload": ["T1105", "T1059"],
+    "domain controller": ["T1018", "T1078.002"],
+    "pass the hash": ["T1550.002"],
+    "psexec": ["T1569.002"],
+    "wmi": ["T1047"],
+    "powershell": ["T1059.001"],
+    "ssl": ["T1573"],
+    "tls": ["T1573"],
+    "persistence": ["T1547"],
+    "privilege": ["T1068"],
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Ingestion node
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -131,41 +207,241 @@ def supervisor_node(state: PipelineState) -> dict[str, Any]:
 
 def route_from_supervisor(
     state: PipelineState,
-) -> Literal["initial_access", "lateral_movement", "exfiltration", "payload", "report_writing"]:
+) -> Literal["initial_access", "lateral_movement", "exfiltration", "payload", "mitre_enrichment"]:
     next_agent = state.get("next_agent", "initial_access")
     if next_agent == "FINISH":
-        return "report_writing"
+        return "mitre_enrichment"
     return next_agent  # type: ignore[return-value]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MITRE ATT&CK enrichment node
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_technique_ids(state: PipelineState) -> list[str]:
+    """Extract ATT&CK technique IDs from agent findings via keyword matching."""
+    text_parts: list[str] = []
+    for key in ("initial_access_findings", "lateral_movement_findings",
+                "exfiltration_findings", "payload_findings"):
+        findings = state.get(key, {})
+        if not findings:
+            continue
+        text_parts.append(json.dumps(findings, default=str))
+    ctx = state.get("attack_context", {})
+    if ctx:
+        text_parts.append(json.dumps(ctx, default=str))
+    combined = " ".join(text_parts).lower()
+    matched: set[str] = set()
+    for keyword, tech_ids in _KEYWORD_TO_TECHNIQUE_IDS.items():
+        if keyword.lower() in combined:
+            matched.update(tech_ids)
+    return sorted(matched)
+
+
+def mitre_enrichment_node(state: PipelineState) -> dict[str, Any]:
+    """Maps agent findings to MITRE ATT&CK techniques and threat groups."""
+    print(f"\n{'─' * 60}")
+    print("  [MITRE] Enriching findings with ATT&CK context…")
+    print(f"{'─' * 60}")
+    _load_mitre()
+
+    matched_ids = _extract_technique_ids(state)
+    print(f"  [MITRE] Matched {len(matched_ids)} technique IDs: {matched_ids}")
+
+    # Build technique detail list
+    techniques: list[dict] = []
+    matched_stix: set[str] = set()
+    for att_id in matched_ids:
+        obj = _MITRE_BY_ATTACK_ID.get(att_id)
+        if not obj:
+            continue
+        matched_stix.add(obj["id"])
+        tactics = [p["phase_name"] for p in obj.get("kill_chain_phases", [])]
+        techniques.append({
+            "attack_id": att_id,
+            "name": obj.get("name", ""),
+            "tactics": tactics,
+            "description": obj.get("description", "")[:300],
+        })
+
+    # Find threat groups using ≥2 of the matched techniques
+    groups: list[dict] = []
+    for group_stix_id, tech_stix_ids in _MITRE_GROUP_TECH_MAP.items():
+        overlap = matched_stix & set(tech_stix_ids)
+        if len(overlap) < 2:
+            continue
+        group_obj = _MITRE_BY_STIX_ID.get(group_stix_id, {})
+        ext_id = next(
+            (r.get("external_id") for r in group_obj.get("external_references", [])
+             if r.get("source_name") == "mitre-attack"), ""
+        )
+        overlap_names = []
+        for sid in overlap:
+            t = _MITRE_BY_STIX_ID.get(sid, {})
+            aid = next((r.get("external_id") for r in t.get("external_references", [])
+                        if r.get("source_name") == "mitre-attack"), "")
+            if aid:
+                overlap_names.append(aid)
+        groups.append({
+            "group_id": ext_id,
+            "name": group_obj.get("name", ""),
+            "aliases": group_obj.get("aliases", []),
+            "description": group_obj.get("description", "")[:300],
+            "matching_techniques": sorted(overlap_names),
+            "overlap_count": len(overlap),
+        })
+    groups.sort(key=lambda g: g["overlap_count"], reverse=True)
+    top_groups = groups[:10]
+
+    print(f"  [MITRE] {len(techniques)} techniques, {len(top_groups)} candidate threat groups")
+    for g in top_groups[:3]:
+        print(f"    → {g['name']} ({g['group_id']}): {g['overlap_count']} overlapping techniques")
+
+    enrichment = {
+        "matched_techniques": techniques,
+        "candidate_threat_groups": top_groups,
+        "technique_ids": matched_ids,
+    }
+    messages = list(state.get("messages", []))
+    messages.append(HumanMessage(content=(
+        f"[MITRE] Enrichment complete: {len(techniques)} techniques, "
+        f"{len(top_groups)} candidate groups."
+    )))
+    return {
+        **state,
+        "mitre_enrichment": enrichment,
+        "messages": messages,
+        "completed_agents": list(state.get("completed_agents", [])) + ["mitre_enrichment"],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PDF export helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _save_pdf(path: Path, content: str) -> None:
+    """Render Markdown report to PDF using reportlab platypus."""
+    import re as _re
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = SimpleDocTemplate(str(path), pagesize=A4,
+                            leftMargin=2*cm, rightMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('H1', parent=styles['Heading1'], fontSize=18, spaceAfter=12, spaceBefore=20)
+    h2 = ParagraphStyle('H2', parent=styles['Heading2'], fontSize=14, spaceAfter=8, spaceBefore=16)
+    h3 = ParagraphStyle('H3', parent=styles['Heading3'], fontSize=12, spaceAfter=6, spaceBefore=12)
+    body = ParagraphStyle('Body', parent=styles['Normal'], fontSize=10, spaceAfter=6, leading=14)
+    bullet = ParagraphStyle('Bullet', parent=body, leftIndent=20, spaceAfter=3)
+    code = ParagraphStyle('Code', parent=styles['Code'], fontSize=8, leftIndent=20, spaceAfter=6)
+
+    def esc(t: str) -> str:
+        return t.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    def fmt(t: str) -> str:
+        t = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', t)
+        t = _re.sub(r'\*(.+?)\*', r'<i>\1</i>', t)
+        t = _re.sub(r'`(.+?)`', r'<font name="Courier">\1</font>', t)
+        return t
+
+    story: list = []
+    in_code = False
+    code_lines: list[str] = []
+
+    for line in content.splitlines():
+        if line.strip().startswith('```'):
+            if in_code:
+                if code_lines:
+                    story.append(Paragraph(esc('\n'.join(code_lines)), code))
+                code_lines = []
+            in_code = not in_code
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        s = line.strip()
+        if not s:
+            story.append(Spacer(1, 6))
+        elif s.startswith('# '):
+            story.append(Paragraph(esc(s[2:]), h1))
+            story.append(HRFlowable(width='100%', thickness=1, color=colors.HexColor('#333333')))
+        elif s.startswith('## '):
+            story.append(Paragraph(esc(s[3:]), h2))
+        elif s.startswith('### '):
+            story.append(Paragraph(esc(s[4:]), h3))
+        elif s.startswith(('- ', '* ', '+ ')):
+            story.append(Paragraph('• ' + fmt(esc(s[2:])), bullet))
+        elif s.startswith('|'):
+            if _re.match(r'^[\s|:\-]+$', s):
+                continue
+            story.append(Paragraph(esc(s.replace('|', ' | ').strip()), code))
+        elif s.startswith('---') or s.startswith('==='):
+            story.append(HRFlowable(width='100%', thickness=0.5, color=colors.HexColor('#aaaaaa')))
+        else:
+            story.append(Paragraph(fmt(esc(s)), body))
+
+    doc.build(story)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Report writing node
 # ──────────────────────────────────────────────────────────────────────────────
 
-_REPORT_TEMPLATE = """\
-You are a senior security analyst writing an incident report.
-Synthesise all findings into a professional, actionable report.
+_REPORT_SYSTEM_PROMPT = """\
+You are a senior incident response report writer for an SC4063-style network forensics case.
 
-Return ONLY the Markdown report. No preamble, no JSON wrapping.
+Core requirements:
+- Produce a complete report with the exact sections below in this order:
+  1) Title/Cover Page
+  2) Table of Contents
+  3) Executive Summary (C-suite audience: root cause, business impact, recommendations)
+  4) Detailed Findings
+  5) Conclusion and Recommendations (prioritized High/Medium/Low)
+  6) Appendix - Timeline
+  7) Appendix - Additional Technical Details
+  8) Evidence Gaps
 
-Use this structure:
-# Security Incident Report — {day}
+Detailed Findings requirements:
+- Map observations to MITRE ATT&CK tactics, techniques, and sub-techniques.
+  Use the provided MITRE enrichment data for accurate technique IDs and names.
+- Cover at minimum: Initial Access, Lateral Movement and Discovery, Exfiltration, Payload.
+- For each candidate threat group, assess likelihood based on technique overlap.
+- Explicitly identify assumptions, confidence level, and scope limits.
+- Include tools used by adversary and analyst where evidence supports it.
 
-## 1. Executive Summary
-## 2. Attack Timeline
-## 3. Initial Access
-## 4. Lateral Movement
-## 5. Exfiltration
-## 6. Payload Analysis
-## 7. Indicators of Compromise (IOCs)
-## 8. Affected Systems
-## 9. Recommendations
+Evidence and anti-hallucination rules:
+- Every significant claim must include supporting evidence references.
+- Prefer concrete references: 5-tuples, host/user identifiers, timestamps, log sources.
+- If evidence is missing, write "Insufficient evidence" rather than guessing.
+- Never fabricate packet IDs, hashes, users, hosts, ATT&CK IDs, or timestamps.
+
+Exfiltration specifics to check when present:
+- Outbound spikes to file-sharing services (especially temp.sh)
+- Large HTTP POST transfers
+- Compression indicators (e.g., 7-Zip magic bytes)
+
+Initial access and movement specifics to check when present:
+- External source into RDP/VPN followed by changed traffic behavior
+- Noisy scans over SMB/RPC (ports 445/135)
+- DCERPC patterns suggesting user/group modifications
+- Potential RDP-based payload drop after domain controller control
+
+Writing style:
+- Professional and concise. Use markdown headings and tables when useful.
+- Separate facts from analyst interpretation.
+- Keep recommendations actionable and prioritized.
+
+Return ONLY the Markdown report. No preamble, no JSON wrapping.\
 """
 
+
 def report_writing_node(state: PipelineState) -> dict[str, Any]:
-    """
-    Uses an LLM to synthesise all agent findings into a cohesive Markdown report.
-    """
+    """Synthesises all agent findings + MITRE enrichment into a report, saved as PDF."""
     day = state.get("target_day", "unknown")
     ia = get_initial_access(state)
     lm = get_lateral_movement(state)
@@ -173,10 +449,13 @@ def report_writing_node(state: PipelineState) -> dict[str, Any]:
     pa = get_payload(state)
     iocs = merge_all_iocs(state)
     ctx = state.get("attack_context", {})
+    mitre = state.get("mitre_enrichment", {})
 
-    report_prompt = f"""{_REPORT_TEMPLATE.format(day=day)}
+    report_prompt = f"""{_REPORT_SYSTEM_PROMPT}
 
 ---
+DAY: {day}
+
 ATTACK CONTEXT:
 {json.dumps(ctx, indent=2, default=str)}
 
@@ -191,6 +470,12 @@ EXFILTRATION FINDINGS:
 
 PAYLOAD ANALYSIS FINDINGS:
 {json.dumps(pa.to_dict() if pa else {}, indent=2, default=str)}
+
+MITRE ATT&CK ENRICHMENT — Matched Techniques:
+{json.dumps(mitre.get('matched_techniques', []), indent=2, default=str)}
+
+MITRE ATT&CK ENRICHMENT — Candidate Threat Groups:
+{json.dumps(mitre.get('candidate_threat_groups', []), indent=2, default=str)}
 
 CONSOLIDATED IOCs ({len(iocs)} total):
 {json.dumps(iocs, indent=2, default=str)}
@@ -209,23 +494,28 @@ Now write the complete incident report as Markdown.
         azure_deployment=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
         api_version="2024-02-01",
         temperature=0.1,
-        max_tokens=4000,
+        max_tokens=6000,
     )
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
 
-    # Save report to work dir
+    # Save Markdown to work dir
     work_dir = state.get("work_dir", "/tmp/sc4063")
-    report_path = Path(work_dir) / day / "incident_report.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(report_content, encoding="utf-8")
+    md_path = Path(work_dir) / day / "incident_report.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(report_content, encoding="utf-8")
 
-    print(f"\n  ✓ Report saved → {report_path}")
+    # Save PDF to project directory
+    pdf_path = _REPO_ROOT / "reports" / f"incident_report_{day}.pdf"
+    _save_pdf(pdf_path, report_content)
+
+    print(f"\n  ✓ Markdown → {md_path}")
+    print(f"  ✓ PDF      → {pdf_path}")
     print(f"  Length: {len(report_content):,} chars")
 
     messages = list(state.get("messages", []))
     messages.append(
-        HumanMessage(content=f"[ReportWriter] Final report generated ({len(report_content):,} chars).")
+        HumanMessage(content=f"[ReportWriter] Report generated ({len(report_content):,} chars). PDF → {pdf_path}")
     )
 
     return {
@@ -240,42 +530,24 @@ Now write the complete incident report as Markdown.
 # Multi-day pipeline helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-_COMBINED_REPORT_TEMPLATE = """\
-You are a senior security analyst writing a multi-day incident report.
-Synthesise findings across ALL days into a single professional, actionable report.
-
-Return ONLY the Markdown report. No preamble, no JSON wrapping.
-
-Use this structure:
-# Security Incident Report — {date_range}
-
-## 1. Executive Summary
-## 2. Campaign Overview (cross-day patterns)
-## 3. Attack Timeline (chronological across all days)
-## 4. Initial Access (per-day summary)
-## 5. Lateral Movement (per-day summary)
-## 6. Exfiltration (per-day summary)
-## 7. Payload Analysis (per-day summary)
-## 8. Consolidated Indicators of Compromise (IOCs)
-## 9. Affected Systems
-## 10. Recommendations
-"""
-
-
 def write_combined_report(
     all_day_results: list[dict],
     work_dir: str,
 ) -> str:
     """
     Call the LLM once with findings from all days to produce a single
-    consolidated incident report.
+    consolidated incident report. Saves both Markdown and PDF.
     """
     days = [r["day"] for r in all_day_results]
     date_range = f"{days[0]} to {days[-1]}" if len(days) > 1 else days[0]
 
-    sections = []
+    sections: list[str] = []
     all_iocs: list[dict] = []
+    all_mitre_techniques: list[dict] = []
+    all_mitre_groups: list[dict] = []
     seen_ioc_keys: set[tuple] = set()
+    seen_tech_ids: set[str] = set()
+    seen_group_ids: set[str] = set()
 
     for r in all_day_results:
         day = r["day"]
@@ -292,10 +564,24 @@ def write_combined_report(
                 seen_ioc_keys.add(key)
                 all_iocs.append(ioc)
 
+        mitre = r.get("mitre_enrichment", {})
+        for t in mitre.get("matched_techniques", []):
+            if t.get("attack_id") not in seen_tech_ids:
+                seen_tech_ids.add(t["attack_id"])
+                all_mitre_techniques.append(t)
+        for g in mitre.get("candidate_threat_groups", []):
+            if g.get("group_id") not in seen_group_ids:
+                seen_group_ids.add(g["group_id"])
+                all_mitre_groups.append(g)
+
     report_prompt = (
-        _COMBINED_REPORT_TEMPLATE.format(date_range=date_range)
-        + "\n---\n"
+        _REPORT_SYSTEM_PROMPT
+        + f"\n\n---\nMulti-day report covering: {date_range}\n"
         + "\n".join(sections)
+        + f"\n\nMITRE ATT&CK — Matched Techniques ({len(all_mitre_techniques)}):\n"
+        + json.dumps(all_mitre_techniques, indent=2, default=str)
+        + f"\n\nMITRE ATT&CK — Candidate Threat Groups ({len(all_mitre_groups)}):\n"
+        + json.dumps(all_mitre_groups[:10], indent=2, default=str)
         + f"\n\nCONSOLIDATED IOCs ({len(all_iocs)} unique):\n"
         + json.dumps(all_iocs, indent=2, default=str)
         + "\n\n---\nNow write the complete multi-day incident report as Markdown."
@@ -311,14 +597,19 @@ def write_combined_report(
         azure_deployment=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
         api_version="2024-02-01",
         temperature=0.1,
-        max_tokens=6000,
+        max_tokens=8000,
     )
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
 
-    report_path = Path(work_dir) / "combined_incident_report.md"
-    report_path.write_text(report_content, encoding="utf-8")
-    print(f"\n  ✓ Combined report saved → {report_path}")
+    md_path = Path(work_dir) / "combined_incident_report.md"
+    md_path.write_text(report_content, encoding="utf-8")
+
+    pdf_path = _REPO_ROOT / "reports" / "combined_incident_report.pdf"
+    _save_pdf(pdf_path, report_content)
+
+    print(f"\n  ✓ Markdown → {md_path}")
+    print(f"  ✓ PDF      → {pdf_path}")
 
     return report_content
 
@@ -365,6 +656,7 @@ def run_all_days_pipeline(
             "lateral_movement_findings":  final_day_state.get("lateral_movement_findings", {}),
             "exfiltration_findings":      final_day_state.get("exfiltration_findings", {}),
             "payload_findings":           final_day_state.get("payload_findings", {}),
+            "mitre_enrichment":           final_day_state.get("mitre_enrichment", {}),
             "iocs":                       merge_all_iocs(final_day_state),  # type: ignore[arg-type]
         })
 
@@ -379,9 +671,9 @@ def build_pipeline(skip_report: bool = False) -> Any:
     """
     Compile the master LangGraph pipeline.
 
-    skip_report=True: omit the report_writing node and terminate after all
-    agents complete.  Used when running --all-days so we only write one
-    combined report at the end instead of nine individual ones.
+    skip_report=True: still runs MITRE enrichment but omits report_writing.
+    Used when running --all-days so we only write one combined report at
+    the end instead of nine individual ones.
     """
     workflow = StateGraph(PipelineState)
 
@@ -392,6 +684,7 @@ def build_pipeline(skip_report: bool = False) -> Any:
     workflow.add_node("lateral_movement", lateral_movement_agent_node)
     workflow.add_node("exfiltration", exfiltration_agent_node)
     workflow.add_node("payload", payload_agent_node)
+    workflow.add_node("mitre_enrichment", mitre_enrichment_node)
 
     if not skip_report:
         workflow.add_node("report_writing", report_writing_node)
@@ -402,43 +695,29 @@ def build_pipeline(skip_report: bool = False) -> Any:
     # ingest → supervisor
     workflow.add_edge("ingest", "supervisor")
 
-    if skip_report:
-        # When all agents are done the supervisor sets next_agent="FINISH";
-        # route that straight to END.
-        def route_no_report(state: PipelineState):
-            next_agent = state.get("next_agent", "initial_access")
-            if next_agent == "FINISH":
-                return END
-            return next_agent  # type: ignore[return-value]
-
-        workflow.add_conditional_edges(
-            "supervisor",
-            route_no_report,
-            {
-                "initial_access":   "initial_access",
-                "lateral_movement": "lateral_movement",
-                "exfiltration":     "exfiltration",
-                "payload":          "payload",
-                END:                END,
-            },
-        )
-    else:
-        workflow.add_conditional_edges(
-            "supervisor",
-            route_from_supervisor,
-            {
-                "initial_access":   "initial_access",
-                "lateral_movement": "lateral_movement",
-                "exfiltration":     "exfiltration",
-                "payload":          "payload",
-                "report_writing":   "report_writing",
-            },
-        )
-        workflow.add_edge("report_writing", END)
+    # supervisor → agents or mitre_enrichment (when all agents done)
+    workflow.add_conditional_edges(
+        "supervisor",
+        route_from_supervisor,
+        {
+            "initial_access":    "initial_access",
+            "lateral_movement":  "lateral_movement",
+            "exfiltration":      "exfiltration",
+            "payload":           "payload",
+            "mitre_enrichment":  "mitre_enrichment",
+        },
+    )
 
     # Each agent loops back to supervisor
     for agent in _AGENT_ORDER:
         workflow.add_edge(agent, "supervisor")
+
+    # mitre_enrichment → report_writing or END
+    if skip_report:
+        workflow.add_edge("mitre_enrichment", END)
+    else:
+        workflow.add_edge("mitre_enrichment", "report_writing")
+        workflow.add_edge("report_writing", END)
 
     return workflow.compile()
 
@@ -515,15 +794,15 @@ Examples:
         combined_report = write_combined_report(all_day_results, args.work_dir)
 
         elapsed = time.time() - t_start
-        report_path = Path(args.work_dir) / "combined_incident_report.md"
+        pdf_path = _REPO_ROOT / "reports" / "combined_incident_report.pdf"
         print(f"\n{'=' * 60}")
         print(f"  All-days pipeline complete in {elapsed:.0f}s")
         print(f"  Days processed : {len(all_day_results)}")
-        print(f"  Combined report: {report_path}")
+        print(f"  PDF report     : {pdf_path}")
         print(f"{'=' * 60}\n")
         print(combined_report[:3000])
         if len(combined_report) > 3000:
-            print(f"\n  … [truncated — see {report_path} for full report]")
+            print(f"\n  … [truncated — see PDF for full report]")
         return
 
     # ── Single-day mode ───────────────────────────────────────────────────
@@ -585,15 +864,12 @@ Examples:
     print(f"{'=' * 60}\n")
 
     if final_state and final_state.get("final_report"):
-        report_path = (
-            Path(args.work_dir) / args.day / "incident_report.md"
-        )
-        print(f"  Final report: {report_path}")
+        pdf_path = _REPO_ROOT / "reports" / f"incident_report_{args.day}.pdf"
+        print(f"  PDF report: {pdf_path}")
         print(f"\n{'─' * 60}")
-        # Print first 3000 chars of report
         print(final_state["final_report"][:3000])
         if len(final_state["final_report"]) > 3000:
-            print(f"\n  … [truncated — see {report_path} for full report]")
+            print(f"\n  … [truncated — see PDF for full report]")
 
 
 if __name__ == "__main__":

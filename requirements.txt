@@ -1,8 +1,10 @@
 langchain
+langchain-anthropic
 langchain-core
 langchain-openai
 langgraph
 openai
 python-dotenv
+reportlab
 requests
 tqdm
