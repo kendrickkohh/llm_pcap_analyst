@@ -1,317 +1,403 @@
-# SC4063 Security Analysis Pipeline
+# SC4063 Agentic Network Forensic Analysis Pipeline
 
-Autonomous multi-agent PCAP forensics pipeline built on LangGraph. Analyses network captures across multiple days, maps findings to MITRE ATT&CK, identifies candidate threat groups, and produces a PDF incident report.
+Autonomous network forensic analysis agent for the SC4063 Final Project. Analyses 9 days of PCAP and Zeek network capture data from the Apex Global Logistics Lynx ransomware incident and produces a structured incident response report.
 
----
+## Table of Contents
 
-## Pipeline Flow
+- [Architecture Overview](#architecture-overview)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Project Structure](#project-structure)
+- [Pipeline Stages](#pipeline-stages)
+- [Tools Reference](#tools-reference)
+- [Key Design Decisions](#key-design-decisions)
+- [Troubleshooting](#troubleshooting)
 
-### All-Days Mode (Two-Phase Ingestion)
+## Architecture Overview
+
+The pipeline uses a **two-pass architecture**:
+
+**Pass 1 -- Zeek Sweep (all 9 days, no PCAPs):**
+Downloads Zeek structured logs for each day and runs four agents (Initial Access triage, Lateral Movement, Exfiltration, Payload) using only parsed log data. Fast, lightweight, and provides full coverage. Determines which days need deeper investigation.
+
+**Pass 2 -- PCAP Drill-Down (flagged days only):**
+Downloads one PCAP per flagged day and runs Initial Access (tshark-based deep analysis) and Payload (file extraction + inspection) agents. Provides packet-level confirmation and artifact extraction.
+
+Both passes feed into a combined MITRE ATT&CK enrichment step and a final LLM-generated incident report (Markdown + PDF).
+
+### Data Flow
+
+1. **Alerts** downloaded for all days, scored for suspect IPs
+2. **Zeek logs** (11 datasets/day) downloaded per day, normalised from ECS/Filebeat format to standard Zeek field names via `shared/ecs_compat.py`
+3. **Agents** consume normalised data, produce structured JSON findings
+4. **Attack context** accumulates chronologically across days (patient zero, compromised hosts, attacker IPs)
+5. **MITRE enrichment** maps findings to ATT&CK techniques and threat groups
+6. **Report writer** synthesises all findings into a single incident report
+
+### Disk Management
+
+A sliding window keeps disk usage under control:
+- Soft limit: 5 GB, hard limit: 8 GB
+- At most 1 day's Zeek + 1 PCAP on disk at a time (~4.5 GB peak)
+- Previous day's data released and evicted before next day downloads
+- Checkpoint after every day -- crash-resilient, resume from last completed day
+
+## Prerequisites
+
+### Required Software
+
+| Software | Version | Purpose |
+|----------|---------|---------|
+| Python | 3.10+ (3.12 recommended) | Pipeline runtime |
+| tshark | 4.x (Wireshark CLI) | PCAP analysis in Pass 2 |
+| pip | Latest | Package installation |
+
+### Required Accounts / API Keys
+
+| Service | Purpose | Required |
+|---------|---------|----------|
+| Azure OpenAI | LLM inference (GPT-4o-mini) | Yes |
+| Google OAuth | Authenticated Drive API downloads (bypasses quota) | Yes |
+| VirusTotal | Payload hash lookup | Optional |
+
+### Hardware Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| CPU | 2 cores | 4+ cores |
+| RAM | 4 GB | 8 GB |
+| Disk | 15 GB free | 30 GB free |
+| GPU | Not required | N/A |
+| Network | Broadband | 50+ MB/s |
+
+The pipeline is CPU-light (~6% peak), RAM-light (~200 MB), and network-bound (80% of runtime is downloading data).
+
+## Installation
+
+```bash
+# Clone or extract the project
+cd SC4063_project
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Verify tshark is available
+tshark --version
+```
+
+### Installing tshark
+
+Ubuntu/Debian:
+```bash
+sudo apt install tshark
+```
+
+macOS:
+```bash
+brew install wireshark
+```
+
+Windows: Install Wireshark from https://www.wireshark.org/ -- tshark is included.
+
+## Configuration
+
+### Environment Variables
+
+Copy the example and fill in your keys:
+
+```bash
+cp .env.example .env
+```
+
+Required variables in `.env`:
 
 ```
-Phase 1: ingest_all_logs()           Download Zeek + Suricata alerts for all 9 days (~MBs)
-              │
-Phase 2: score_alerts()              Parse all Suricata alerts, rank IPs by severity score
-         select_pcaps()              Map alert density per hour → PCAP index, pick top N
-              │
-Phase 3: download_selected_pcaps()   Download only the most suspicious PCAPs per day
-              │
-Phase 4: per-day agent pipeline      Run all 4 agents + MITRE enrichment per day
-              │
-Final:   write_combined_report()     LLM generates combined PDF incident report
+# Azure OpenAI (required)
+AZURE_OPENAI_ENDPOINT=https://your-instance.openai.azure.com/
+AZURE_OPENAI_API_KEY=your-api-key
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
+
+# VirusTotal (optional -- payload agent skips VT lookup if not set)
+VIRUSTOTAL_API_KEY=your-vt-key
+
+# tshark path (auto-detected if on PATH)
+TSHARK_PATH=/usr/bin/tshark
 ```
 
-### Per-Day Agent Pipeline
+### Google OAuth Setup
 
-```
-ingest → supervisor → agents (loop) → supervisor → mitre_enrichment → report_writing → END
-```
+The pipeline uses authenticated Google Drive API to bypass public download quota limits. Required files:
 
+- `oauth-client.json` -- OAuth 2.0 client credentials (from Google Cloud Console)
+- `oauth-token.json` -- Refresh token (generated on first auth)
+
+To generate the token:
+```bash
+python auth_drive.py
 ```
-┌─────────────────────────────────────┐
-│          master_pipeline.py          │
-│        (LangGraph orchestrator)      │
-└──────────────┬──────────────────────┘
-               ▼
-┌─────────────────────────────────────┐
-│            ingest_node               │
-│  shared/pcap_api.py                  │
-│  • Fetches alerts, Zeek logs, PCAP   │
-│  • Returns ZeekContext               │
-└──────────────┬──────────────────────┘
-               ▼
-┌─────────────────────────────────────┐
-│          supervisor_node             │
-│  Deterministic routing:             │
-│  initial_access → lateral_movement  │
-│  → exfiltration → payload → FINISH  │
-└──────────────┬──────────────────────┘
-    ┌──────────┼──────────┬───────────┐
-    ▼          ▼          ▼           ▼
-┌────────┐┌────────┐┌────────┐┌──────────┐
-│Initial ││Lateral ││ Exfil  ││ Payload  │
-│Access  ││Movement││ Agent  ││ Agent    │
-└───┬────┘└───┬────┘└───┬────┘└────┬─────┘
-    └─────────┴─────────┴──────────┘
-               │ (all loop back to supervisor)
-               ▼
-┌─────────────────────────────────────┐
-│       mitre_enrichment_node          │
-│  • Loads enterprise-attack.json      │
-│  • Maps findings → ATT&CK techniques│
-│  • Identifies candidate threat groups│
-└──────────────┬──────────────────────┘
-               ▼
-┌─────────────────────────────────────┐
-│        report_writing_node           │
-│  Azure GPT-4o                        │
-│  • MITRE-enriched system prompt      │
-│  • Anti-hallucination constraints    │
-│  • Outputs PDF to reports/           │
-└─────────────────────────────────────┘
+This opens a browser for Google OAuth consent. The token is saved to `oauth-token.json`.
+
+## Usage
+
+### Full Analysis (All 9 Days)
+
+```bash
+source venv/bin/activate
+python master_pipeline.py --all-days --work-dir data
 ```
 
----
+This runs the complete two-pass pipeline:
+1. Downloads alerts for all 9 days
+2. Scores alerts and ranks PCAPs
+3. Pass 1: Zeek sweep of all days (no PCAPs)
+4. Pass 2: PCAP drill-down on flagged days
+5. Generates combined incident report
 
-## Smart Ingestion
+Output: `reports/<run_id>/combined_incident_report.md` and `.pdf`
 
-The pipeline uses Suricata alert scoring to select which PCAPs to download, instead of downloading all ~72 PCAPs (~25 GB).
+### Single Day Analysis
 
-### How it works
+```bash
+python master_pipeline.py --day 2025-03-06 --work-dir data
+```
 
-1. **Download lightweight logs first** — Suricata `alerts.ndjson` + Zeek NDJSON logs for all 9 days (small files, fast)
-2. **Score alerts across all days** — parse every alert, weight by severity (severity 1 = 3 pts, severity 2 = 2 pts, severity 3 = 1 pt), rank source IPs globally
-3. **Rank all PCAPs globally** — each day has 8 sequential PCAPs covering ~45 min each. Group suspect-IP alerts by hour, map to the corresponding PCAP index, score each PCAP, rank across all days
-4. **Human-in-the-loop selection** — the pipeline presents a ranked table of all suspicious PCAPs with scores and sizes. The analyst chooses how many to ingest (e.g., "5" downloads the top 5 most suspicious PCAPs across all days)
+Runs the full pipeline (ingest + all 4 agents + MITRE + report) for one day.
 
-This avoids downloading ~25 GB blindly and lets the analyst control the scope of analysis.
+### Single Day with Local PCAP
 
----
+```bash
+python master_pipeline.py --day 2025-03-09 \
+  --pcap data/2025-03-09/pcap/34936-sensor-250309-00002476_redacted.pcap \
+  --work-dir data
+```
 
-## Agent Details
+Skips API ingestion and uses a local PCAP. Auto-discovers Zeek files in `data/<day>/zeek/`.
 
-### 1. Initial Access Agent
+### Single Agent Debug Mode
 
-Identifies how the attacker first gained access to the network.
+```bash
+python master_pipeline.py --day 2025-03-06 --only lateral_movement --work-dir data
+```
 
-| Aspect | Detail |
-|---|---|
-| **Data sources** | PCAP file (via tshark) |
-| **LLM** | Azure OpenAI GPT-4o-mini |
-| **Agent type** | ReAct agent with function calling (up to 30 steps) |
+Runs only one agent. Useful for debugging. Options: `initial_access`, `lateral_movement`, `exfiltration`, `payload`, `report`.
 
-**Detection methods:**
-- **tshark protocol hierarchy** — identifies dominant protocols in the capture
-- **IP conversation analysis** — ranks hosts by bytes transferred, identifies top talkers
-- **RDP brute-force detection** — counts SYN packets to port 3389 grouped by source IP; flags IPs with high attempt counts
-- **Successful session identification** — compares session byte counts; successful RDP logins are 10-100x larger than failed attempts (50-500 KB vs 2-5 KB)
-- **Pre-existing compromise check** — searches for C2 beacon domains (RMM tools, TacticalRMM, MeshCentral) and external IP lookups active from capture start
-- **DNS analysis** — queries for known malicious domain patterns
+### CLI Options
 
-**Output:** Patient zero IP, attacker IP, attack vector, exposed service, brute-force count, session timeline, IOCs.
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--day YYYY-MM-DD` | Single day to analyse | -- |
+| `--all-days` | Analyse all available days | -- |
+| `--work-dir PATH` | Directory for downloads and outputs | `./data` |
+| `--pcap PATH` | Skip ingestion, use local PCAP | -- |
+| `--only AGENT` | Run only one agent (debug mode) | -- |
+| `--no-provenance` | Disable evidence provenance tracking | Enabled |
+| `--disk-soft-gb N` | Soft disk budget in GB | 5.0 |
+| `--disk-hard-gb N` | Hard disk budget in GB | 8.0 |
 
----
+### Non-Interactive Mode
 
-### 2. Lateral Movement Agent
+When run without a terminal (e.g., background process, CI/CD), the pipeline automatically:
+- Selects the best PCAP per day by alert score (no HITL prompt)
+- Uses generous drill-down thresholds (errs on the side of investigating)
 
-Tracks how the attacker moved between internal hosts after initial compromise.
+### Resuming from Crash
 
-| Aspect | Detail |
-|---|---|
-| **Data sources** | Zeek logs (SMB, RDP, NTLM, Kerberos, DCE/RPC), PCAP fallback via tshark |
-| **LLM** | Azure OpenAI |
-| **Agent type** | ReAct agent with function calling (up to 12 steps) |
+The pipeline checkpoints after every day. If it crashes:
+```bash
+# Just re-run the same command -- it resumes automatically
+python master_pipeline.py --all-days --work-dir data
+```
 
-**Detection methods:**
-- **SMB analysis** — parses `zeek.smb_files.ndjson` and `zeek.smb_mapping.ndjson` for admin share access (ADMIN$, IPC$, C$), PsExec artifacts, and file transfers between internal hosts
-- **RDP lateral sessions** — identifies internal-to-internal RDP connections (port 3389) from `zeek.rdp.ndjson`, tracks authentication cookies
-- **NTLM authentication** — detects pass-the-hash and credential relay from `zeek.ntlm.ndjson`; flags failed authentication attempts as spray indicators
-- **Kerberos anomalies** — identifies AS-REP roasting (no pre-auth), kerberoasting (TGS-REQ for service accounts), and overpass-the-hash from `zeek.kerberos.ndjson`
-- **DCE/RPC remote execution** — detects service creation (SCM), WMI calls, DCOM, and Task Scheduler operations from `zeek.dce_rpc.ndjson` (common PsExec/Impacket indicators)
-- **Internal-only filtering** — only considers RFC1918 ↔ RFC1918 traffic
-- **Host pair frequency** — groups operations by source/destination pair, ranks by frequency to identify movement chains
+To force a fresh run, delete the checkpoint:
+```bash
+rm data/.pipeline_checkpoint.json
+```
 
-**Output:** Movement paths (IP pairs), compromised hosts, techniques used, TacticalRMM assessment, evidence highlights, IOCs.
-
----
-
-### 3. Exfiltration Agent
-
-Detects data theft and covert data channels.
-
-| Aspect | Detail |
-|---|---|
-| **Data sources** | Zeek logs (connection, DNS, HTTP, SSL, files) |
-| **LLM** | Azure OpenAI (for narrative summarisation) |
-| **Agent type** | Analysis pipeline + LLM summariser |
-
-**Detection methods:**
-- **Volume anomaly detection** — identifies spikes in outbound bytes to external destinations relative to baseline traffic
-- **Beaconing detection** — finds regular periodic connections to the same external IP/domain (C2 heartbeat pattern)
-- **DNS tunneling** — flags DNS queries with unusually large payloads or high response sizes (covert data exfiltration via DNS)
-- **HTTP upload detection** — identifies large HTTP POST/PUT transfers to non-standard external hosts
-- **File-sharing service detection** — checks for uploads to known services (e.g., temp.sh)
-- **Compression indicators** — looks for 7-Zip magic bytes in transferred data
-- **Confidence scoring** — combined LOW/MEDIUM/HIGH assessment across all indicators
-
-**Output:** Detected flag, data volume, destination IPs/domains, protocols used, timeframe, confidence level, IOCs.
-
----
-
-### 4. Payload Agent
-
-Analyses extracted files for malware indicators.
-
-| Aspect | Detail |
-|---|---|
-| **Data sources** | PCAP file (HTTP object extraction via tshark) |
-| **LLM** | Azure OpenAI GPT-4o |
-| **Agent type** | Strict 3-step workflow agent |
-
-**Detection methods:**
-- **HTTP object extraction** — uses tshark to carve files from HTTP traffic in the PCAP
-- **SHA256 + VirusTotal lookup** — hashes each extracted file and checks reputation via the VirusTotal API; flags files detected by any engine
-- **File magic analysis** — reads hex headers to identify true file type (PE/EXE, ELF, Mach-O); detects extension mismatches (e.g., `.txt` file with MZ header)
-- **Shannon entropy scoring** — calculates byte entropy; >7.0 indicates packed/encrypted/obfuscated content; small file (<1 KB) + high entropy = shellcode indicator
-- **Combined verdict** — MALICIOUS (VT hits), SUSPICIOUS (high entropy or type mismatch), or CLEAN
-
-**Output:** Files analysed, malicious/suspicious/clean file lists with SHA256 hashes, VirusTotal stats, entropy scores, IOCs.
-
----
-
-### 5. MITRE ATT&CK Enrichment
-
-Maps agent findings to the MITRE ATT&CK framework and identifies candidate threat groups.
-
-| Aspect | Detail |
-|---|---|
-| **Data source** | `mitre_reference/enterprise-attack.json` (STIX 2.0, 835 techniques, 187 groups) |
-| **Method** | Keyword extraction + graph lookup (no LLM) |
-
-**How it works:**
-- Extracts behavioural keywords from all agent findings (e.g., "rdp", "smb", "brute", "dns")
-- Maps keywords to ATT&CK technique IDs via a lookup table (e.g., RDP → T1021.001, SMB → T1021.002)
-- Queries the STIX relationship graph for threat groups that use >=2 of the matched techniques
-- Ranks groups by overlap count and returns top 10 candidates
-
----
-
-### 6. Report Writer
-
-Generates the final incident report as PDF.
-
-| Aspect | Detail |
-|---|---|
-| **LLM** | Azure OpenAI GPT-4o-mini |
-| **Output** | Markdown + PDF (saved to `reports/`) |
-
-**Report sections:** Title, Table of Contents, Executive Summary, Detailed Findings (with MITRE mappings), Conclusion & Recommendations (prioritised High/Medium/Low), Timeline Appendix, Technical Details Appendix, Evidence Gaps.
-
-**Anti-hallucination rules:** Every claim must cite evidence (5-tuples, timestamps, log sources). Missing evidence must be stated as "Insufficient evidence". No fabricated IDs, hashes, or timestamps.
-
----
-
-## Directory Structure
+## Project Structure
 
 ```
 SC4063_project/
-├── master_pipeline.py              # Orchestrator — run this
-├── initial_access_agent.py         # InitialAccess ForensicAgent
-├── payload_agent.py                # Payload agent
-├── requirements.txt
-├── .env                            # API keys (not committed)
-│
-├── shared/
-│   ├── data_contract.py            # Canonical data types & state schema
-│   └── pcap_api.py                 # SC4063 API client + ingestion + scoring
-│
-├── agents/
-│   ├── initial_access_adapter.py   # Wraps agent.py → PipelineState
-│   ├── lateral_movement_adapter.py # Wraps lateral_movement.py → PipelineState
-│   ├── exfiltration_agent.py       # Zeek-aware exfiltration agent
-│   └── payload_agent_adapter.py    # Wraps payload_agent.py → PipelineState
-│
-├── lateral_movement/
-│   └── lateral_movement.py         # Lateral movement agent
-│
-├── mitre_reference/
-│   └── enterprise-attack.json      # MITRE ATT&CK STIX bundle (used by enrichment)
-│
-└── reports/                        # Generated PDF reports (output)
+|-- master_pipeline.py              # Main orchestrator (two-pass architecture)
+|-- initial_access_agent.py         # ForensicAgent: tshark ReAct loop + Zeek seeds
+|-- payload_agent.py                # Payload detection: 4 Zeek + 4 PCAP tools
+|-- .env                            # API keys (not committed)
+|-- requirements.txt                # Python dependencies
+|-- oauth-client.json               # Google OAuth client credentials
+|-- oauth-token.json                # Google OAuth refresh token
+|-- auth_drive.py                   # Google OAuth token generator
+|-- copy_drive_files.py             # Drive folder copy utility (quota management)
+|
+|-- agents/                         # Agent adapters (PipelineState interface)
+|   |-- initial_access_adapter.py   # Wraps ForensicAgent for pipeline
+|   |-- lateral_movement_adapter.py # Wraps LM agent for pipeline
+|   |-- exfiltration_agent.py       # Exfiltration agent + zeek_root adapter
+|   |-- payload_agent_adapter.py    # Wraps payload agent for pipeline
+|
+|-- lateral_movement/               # Lateral movement detection
+|   |-- lateral_movement.py         # 5 Zeek-based tools + LLM ReAct loop
+|
+|-- exfil/                          # Exfiltration detection module
+|   |-- exfiltration_tool.py        # Volume spike + beaconing detection
+|   |-- dns_exfiltration.py         # DNS tunneling detection
+|   |-- http_exfiltration.py        # HTTP upload detection
+|   |-- exfiltration_summarizer.py  # LLM narrative summariser
+|   |-- exfiltration_pipeline_runner.py  # Orchestrates exfil sub-pipeline
+|   |-- pcap_ingestor.py            # PCAP-to-Zeek converter (local zeek binary)
+|   |-- shard_api_client.py         # Direct API client for exfil module
+|
+|-- shared/                         # Shared utilities
+|   |-- data_contract.py            # PipelineState TypedDict + canonical accessors
+|   |-- ecs_compat.py               # ECS/Filebeat to standard Zeek field normalisation
+|   |-- pcap_api.py                 # SC4063 API client (alerts, Zeek, PCAPs)
+|   |-- disk_manager.py             # Disk budget manager + provenance tracking
+|   |-- api_config.py               # API endpoint pool with failover
+|
+|-- mitre_reference/
+|   |-- enterprise-attack.json      # MITRE ATT&CK database (835 techniques)
+|
+|-- data/                           # Working directory (downloads, checkpoints)
+|   |-- .pipeline_checkpoint.json   # Auto-saved pipeline state
+|   |-- .disk_manifest.json         # Disk budget tracking
+|   |-- 2025-03-XX/                 # Per-day data (alerts, zeek/, pcap/)
+|
+|-- reports/                        # Generated reports
+    |-- <run_id>/
+        |-- combined_incident_report.md
+        |-- combined_incident_report.pdf
 ```
 
----
+## Pipeline Stages
 
-## Setup
+### Phase 0: Triage
+- Downloads Suricata alerts for all 9 days
+- Scores alerts across days to identify suspect IPs and high-activity periods
+- Ranks all PCAPs globally by alert density
 
-### 1. Install dependencies
+### Pass 1: Zeek Sweep
 
+For each day (chronologically):
+
+1. **Download Zeek logs** (11 datasets: connection, DNS, RDP, HTTP, SMB files, SMB mapping, DCE-RPC, Kerberos, SSL, notice, weird)
+2. **IA Triage** -- Deterministic scan of Zeek RDP + connection logs. Counts brute-force attempts, identifies largest RDP session (likely successful login), extracts patient_zero and attacker_ip.
+3. **Lateral Movement Agent** -- LLM ReAct loop calls 5 tools to detect SMB admin share access, internal RDP, Kerberos anomalies, DCE-RPC service creation/SAMR enumeration.
+4. **Exfiltration Agent** -- Analyses connection, DNS, HTTP, SSL logs for volume spikes, DNS tunneling, HTTP uploads.
+5. **Payload Agent** -- Detects SMB file drops (executables, archives), RDP from DC, WinRM/WMI/DCOM remote execution, suspicious HTTP downloads.
+6. **MITRE Enrichment** -- Maps findings to ATT&CK techniques and identifies candidate threat groups.
+7. **Drill-down decision** -- Flags day for PCAP analysis if any suspicious activity detected.
+
+### Pass 2: PCAP Drill-Down
+
+For each flagged day:
+
+1. **Download 1 PCAP** (highest alert score for that day)
+2. **Initial Access Agent** -- Full ForensicAgent with tshark: Zeek-based seed queries (fast) + LLM-driven ad-hoc tshark queries (up to 30 steps)
+3. **Payload Agent** -- All Zeek tools + tshark file extraction (--export-objects http/smb), file inspection (SHA256, entropy, magic numbers), custom pattern search
+4. **MITRE re-enrichment** with combined Pass 1 + Pass 2 findings
+
+### Report Generation
+- LLM synthesises all per-day findings into a single combined report
+- Structured sections: Executive Summary, Detailed Findings (per attack phase), MITRE mapping, Threat Group Assessment, Timeline, Recommendations, Evidence Gaps
+- Evidence Provenance appendix lists exactly which files each agent accessed
+
+## Tools Reference
+
+### Lateral Movement Agent (5 tools)
+| Tool | Data Source | Detects |
+|------|-----------|---------|
+| `smb_lateral_movement` | zeek.smb_files + smb_mapping | Admin share access (IPC$, ADMIN$), PsExec artifacts, file share operations |
+| `rdp_lateral_movement` | zeek.rdp | Internal RDP sessions (host-to-host) |
+| `ntlm_auth_events` | tshark fallback | Pass-the-hash, credential relay, spray patterns |
+| `kerberos_events` | zeek.kerberos | Kerberoasting, pass-the-ticket, AS-REP roasting |
+| `dce_rpc_events` | zeek.dce_rpc | Service creation (SCM), WMI, DCOM, SAMR user/group manipulation |
+
+### Payload Agent (8 tools)
+| Tool | Pass | Data Source | Detects |
+|------|------|-----------|---------|
+| `smb_file_drops` | 1+2 | zeek.smb_files | Executable/archive writes via SMB |
+| `rdp_from_dc` | 1+2 | zeek.rdp + connection | RDP from DC to targets (payload deployment) |
+| `remote_execution_events` | 1+2 | zeek.dce_rpc + http | WinRM, WMI, DCOM, service creation |
+| `http_payload_downloads` | 1+2 | zeek.http | Suspicious downloads from external IPs |
+| `extract_http_objects` | 2 | PCAP | Extract files from HTTP streams |
+| `extract_smb_objects` | 2 | PCAP | Extract files from SMB streams |
+| `inspect_file` | 2 | Extracted file | SHA256, entropy, magic number analysis |
+| `search_pcap_for_pattern` | 2 | PCAP | Custom tshark display filter queries |
+
+### Initial Access Agent (6 tools, Pass 2 only)
+| Tool | Detects |
+|------|---------|
+| `pcap_overview` | Capture metadata (duration, packet count, file size) |
+| `tcp_conversations` | TCP sessions sorted by bytes (find successful logins) |
+| `packet_query` | Custom display filter queries |
+| `group_count` | Packet counts grouped by field (e.g., brute-force source IPs) |
+| `protocol_hierarchy` | Protocol distribution |
+| `ip_conversations` | IP-level conversation summary |
+
+### Exfiltration Agent (3 modules)
+| Module | Detects |
+|--------|---------|
+| `exfiltration_tool` | Outbound volume spikes, beaconing patterns |
+| `dns_exfiltration` | DNS tunneling (high entropy, long queries, rare domains) |
+| `http_exfiltration` | Large HTTP POST uploads, file-sharing service usage |
+
+## Key Design Decisions
+
+### ECS Normalisation Layer
+The SC4063 API serves Zeek logs in Elastic Common Schema (ECS/Filebeat) format, not standard Zeek JSON. The `shared/ecs_compat.py` module auto-detects the format and translates 40+ fields across 12 log types. This is transparent to all agent tools -- they use standard field names like `rec.get("id.orig_h")` regardless of the underlying format.
+
+### Two-Pass vs Single-Pass
+A single-pass approach (download PCAPs + Zeek for every day) would require ~50 GB of disk and ~12+ hours. The two-pass approach downloads only Zeek in Pass 1 (~2 GB/day) and PCAPs only for flagged days in Pass 2. This reduces disk usage to ~4.5 GB peak and runtime to ~6.2 hours.
+
+### Quota Latch
+Google Drive public download links hit per-file quota limits quickly. The pipeline implements a "quota latch" -- on the first quota failure, all subsequent downloads permanently switch to the authenticated Drive API. This eliminates ~30 minutes of wasted retry attempts.
+
+### Chronological Context
+Attack context (patient_zero, attacker_ips, compromised_hosts) accumulates as days are processed in order. Day N+1's agents receive all findings from days 1 through N, enabling them to make more targeted analysis decisions.
+
+### Checkpoint/Resume
+Pipeline state is saved to `.pipeline_checkpoint.json` after every completed day. On crash or interruption, re-running the same command automatically resumes from the last checkpoint. The checkpoint includes all findings, drill-down decisions, and provenance data.
+
+## Troubleshooting
+
+### Common Issues
+
+**Pipeline crashes with `AZURE_OPENAI_ENDPOINT not set`:**
+Ensure `.env` file exists with valid Azure OpenAI credentials.
+
+**tshark not found:**
+Install Wireshark/tshark or set `TSHARK_PATH` in `.env`.
+
+**Google Drive quota errors on every file:**
+Ensure `oauth-token.json` exists and contains a valid refresh token. Run `python auth_drive.py` to regenerate.
+
+**Pipeline stuck on download:**
+Google Drive authenticated API throughput is ~10 MB/s. Large Zeek files (1-2 GB) take several minutes. Check progress by monitoring `data/<day>/zeek/` directory.
+
+**Disk full during run:**
+Increase disk budget: `--disk-soft-gb 8 --disk-hard-gb 12`. The sliding window should prevent this, but very large Zeek datasets can temporarily exceed the soft limit.
+
+**Resuming a failed run:**
+Just re-run the same command. The checkpoint system handles resume automatically.
+
+**Forcing a fresh run:**
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+rm data/.pipeline_checkpoint.json
+python master_pipeline.py --all-days --work-dir data
 ```
 
-### 2. Set environment variables
+### Monitoring a Run
 
-Create a `.env` file in the project root:
-
+The pipeline prints progress to stdout. For background runs, use:
 ```bash
-AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com/
-AZURE_OPENAI_API_KEY=<key>
-AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
-VIRUSTOTAL_API_KEY=<key>
-TSHARK_PATH=/usr/bin/tshark   # optional — auto-detected
+PYTHONUNBUFFERED=1 python master_pipeline.py --all-days --work-dir data 2>&1 | tee pipeline.log
 ```
 
-### 3. Run the pipeline
-
+Check checkpoint status:
 ```bash
-# All days with smart PCAP selection + human-in-the-loop (recommended)
-python master_pipeline.py --all-days
-
-# Single day
-python master_pipeline.py --day 2025-03-06
-
-# Custom work directory
-python master_pipeline.py --all-days --work-dir ./data
+python3 -c "import json; d=json.load(open('data/.pipeline_checkpoint.json')); print(f'days={len(d[\"completed_days\"])} sweep={d[\"sweep_done\"]} drill={len(d[\"drilldown_days\"])}')"
 ```
-
-### 4. Debug a single agent
-
-```bash
-python master_pipeline.py --day 2025-03-06 \
-    --pcap /tmp/sc4063/2025-03-06/pcap/capture.pcap \
-    --only exfiltration
-```
-
-### 5. Output
-
-Reports are saved to `reports/` in the project root:
-
-- All days: `reports/combined_incident_report.pdf`
-- Single day: `reports/incident_report_YYYY-MM-DD.pdf`
-
-Markdown copies are also saved to the work directory (`/tmp/sc4063/` by default).
-
----
-
-## Data Contract
-
-All agents read from and write to `PipelineState` (defined in `shared/data_contract.py`).
-
-| Key | Type | Written by | Read by |
-|---|---|---|---|
-| `target_day` | `str` | caller | ingest |
-| `pcap_file` | `str` | ingest | all agents |
-| `pcap_files` | `list[str]` | ingest | agents |
-| `zeek_context` | `ZeekContext` | ingest | all agents |
-| `alert_scoring` | `dict` | ingest | report_writing |
-| `attack_context` | `dict` | all agents | all agents |
-| `initial_access_findings` | `dict` | initial_access | supervisor, report |
-| `lateral_movement_findings` | `dict` | lateral_movement | supervisor, report |
-| `exfiltration_findings` | `dict` | exfiltration | supervisor, report |
-| `payload_findings` | `dict` | payload | supervisor, report |
-| `mitre_enrichment` | `dict` | mitre_enrichment | report_writing |
-| `final_report` | `str` | report_writing | caller |
-| `completed_agents` | `list[str]` | each node | supervisor |

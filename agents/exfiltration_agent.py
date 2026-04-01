@@ -38,7 +38,7 @@ _NDJSON_TO_LOG = {
     "zeek.dns.ndjson":        "dns.log",
     "zeek.ssl.ndjson":        "ssl.log",
     "zeek.http.ndjson":       "http.log",
-    "zeek.files.ndjson":      "files.log",
+    # "zeek.files.ndjson": "files.log",  # not available in this capture's API
 }
 
 
@@ -58,11 +58,18 @@ def _prepare_zeek_root(zeek_ctx, work_dir: str) -> str:
 
     for ndjson_name, log_name in _NDJSON_TO_LOG.items():
         src = zeek_ctx.zeek_files.get(ndjson_name)
-        if not src or not Path(src).exists():
+        if not src:
+            print(f"  [Exfiltration] WARNING: {ndjson_name} not in zeek_files — "
+                  f"{log_name} will be missing from analysis")
+            continue
+        if not Path(src).exists():
+            print(f"  [Exfiltration] WARNING: {ndjson_name} path does not exist "
+                  f"on disk: {src}")
             continue
         dst = zeek_compat / log_name
-        if dst.exists():
-            continue
+        # Remove stale/dangling symlinks from previous days before re-creating
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
         try:
             os.symlink(str(Path(src).resolve()), str(dst))
         except OSError:

@@ -26,15 +26,12 @@ import requests
 from tqdm.auto import tqdm
 
 from shared.data_contract import ZeekContext
+from shared.disk_manager import get_disk_manager, get_provenance, ALERT, ZEEK, PCAP
+from shared.api_config import get_api_base, mark_endpoint_failed
 
 # ──────────────────────────────────────────────────────────────────────────────
 # API configuration
 # ──────────────────────────────────────────────────────────────────────────────
-
-API_BASE = (
-    "https://script.google.com/macros/s/"
-    "AKfycbxpkayBZGiYl-dbQ1P8SpLmjn4P8F9ZhPg3djTMSIv9Aj3C106uiOsRTC9zWQ2w0nl6/exec"
-)
 
 # Zeek datasets that are most useful for each agent.
 # The ingestion layer downloads ALL of these by default; agents read what
@@ -47,10 +44,10 @@ PRIORITY_ZEEK_DATASETS = [
     "zeek.smb_files.ndjson",
     "zeek.smb_mapping.ndjson",
     "zeek.dce_rpc.ndjson",
-    "zeek.ntlm.ndjson",
     "zeek.kerberos.ndjson",
     "zeek.ssl.ndjson",
     "zeek.notice.ndjson",
+    "zeek.weird.ndjson",         # protocol anomalies — useful for evasion detection
 ]
 
 
@@ -59,20 +56,24 @@ PRIORITY_ZEEK_DATASETS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _call_api(params: dict, timeout: int = 60, retries: int = 3) -> dict:
-    """GET the API endpoint with retry logic."""
+    """GET the API endpoint with retry + failover across endpoints."""
+    last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
+        api_base = get_api_base()
         try:
-            r = requests.get(API_BASE, params=params, timeout=timeout)
+            r = requests.get(api_base, params=params, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as exc:
-            if attempt == retries:
-                raise RuntimeError(
-                    f"API call failed after {retries} attempts: {exc}"
-                ) from exc
-            wait = 2 ** attempt
-            print(f"  [api] Attempt {attempt} failed ({exc}). Retrying in {wait}s…")
-            time.sleep(wait)
+            last_exc = exc
+            mark_endpoint_failed(api_base)
+            if attempt < retries:
+                wait = 2 ** attempt
+                print(f"  [api] Attempt {attempt} failed ({exc}). Trying next endpoint in {wait}s…")
+                time.sleep(wait)
+    raise RuntimeError(
+        f"API call failed after {retries} attempts across all endpoints: {last_exc}"
+    ) from last_exc
 
 
 def _looks_like_html(response: requests.Response) -> bool:
@@ -105,6 +106,141 @@ def _extract_confirm_url(
 
 _MIN_PCAP_SIZE = 10_000  # 10 KB — any PCAP smaller than this is corrupt/HTML
 
+# ── Quota latch: once any public link hits quota, skip all public links ──────
+_quota_latched = False
+
+
+def _is_quota_error(html: str) -> bool:
+    """Check if an HTML response is a Google Drive quota exceeded page."""
+    lower = html.lower()
+    return "quota" in lower or "can&#39;t view or download" in lower
+
+
+def _extract_drive_file_id(url: str) -> Optional[str]:
+    """Extract Google Drive file ID from a download URL."""
+    if "id=" in url:
+        return url.split("id=")[-1].split("&")[0]
+    return None
+
+
+def _try_authenticated_download(
+    file_id: str,
+    out_path: Path,
+    filename: str,
+    chunk_size: int = 10 * 1024 * 1024,
+) -> bool:
+    """
+    Download a file via the authenticated Google Drive API.
+    Bypasses per-file sharing quota (uses per-user API quota instead).
+    Returns True on success, False if auth is unavailable.
+    """
+    token_path = Path(__file__).parent.parent / "oauth-token.json"
+    if not token_path.exists():
+        return False
+
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request as GRequest
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+
+        creds = Credentials.from_authorized_user_file(str(token_path), ["https://www.googleapis.com/auth/drive"])
+        if creds.expired and creds.refresh_token:
+            creds.refresh(GRequest())
+            token_path.write_text(creds.to_json())
+
+        drive = build("drive", "v3", credentials=creds)
+        request = drive.files().get_media(fileId=file_id)
+
+        with open(out_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request, chunksize=chunk_size)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    pct = int(status.progress() * 100)
+                    if pct % 20 == 0:
+                        print(f"    [api-dl] {filename}: {pct}%")
+
+        print(f"  [api-dl] {filename}: complete")
+        return True
+    except ImportError:
+        return False
+    except Exception as exc:
+        print(f"  [api-dl] {filename}: failed — {exc}")
+        if out_path.exists():
+            out_path.unlink(missing_ok=True)
+        return False
+
+
+def _try_download_url(
+    url: str,
+    out_path: Path,
+    filename: str,
+    is_pcap: bool,
+    chunk_size: int = 1024 * 1024,
+) -> Path:
+    """
+    Attempt a single download from a URL.  Handles virus-scan confirm pages.
+    Raises RuntimeError on quota or other failures.
+    """
+    session = requests.Session()
+    response = session.get(url, stream=True, timeout=120)
+    response.raise_for_status()
+
+    if _looks_like_html(response):
+        html = response.text
+
+        if _is_quota_error(html):
+            raise RuntimeError(f"Google Drive quota exceeded for {filename}")
+
+        confirm_url, confirm_params = _extract_confirm_url(html, response.url)
+        if not confirm_url:
+            raise RuntimeError(
+                "Received HTML instead of file; could not extract confirm URL."
+            )
+        response.close()
+        response = session.get(
+            confirm_url, params=confirm_params, stream=True, timeout=120
+        )
+        response.raise_for_status()
+
+        if _looks_like_html(response):
+            error_text = response.text[:500]
+            if _is_quota_error(error_text):
+                raise RuntimeError(f"Google Drive quota exceeded for {filename}")
+            raise RuntimeError(
+                f"Still received HTML after confirm redirect: {error_text[:200]}"
+            )
+
+    total = int(response.headers.get("content-length", 0))
+    written = 0
+
+    with open(out_path, "wb") as f, tqdm(
+        total=total if total > 0 else None,
+        unit="B",
+        unit_scale=True,
+        desc=filename,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if not chunk:
+                continue
+            f.write(chunk)
+            written += len(chunk)
+            bar.update(len(chunk))
+
+    response.close()
+
+    if total > 0 and written != total:
+        raise IOError(f"Incomplete download: expected {total} B, got {written} B")
+
+    if is_pcap and written < _MIN_PCAP_SIZE:
+        raise RuntimeError(
+            f"Downloaded PCAP is too small ({written} B) — likely an error page."
+        )
+
+    return out_path
+
 
 def download_file(
     url: str,
@@ -112,10 +248,19 @@ def download_file(
     out_dir: str,
     attempts: int = 2,
     chunk_size: int = 1024 * 1024,
+    resolve_alt_url: Optional[Any] = None,
 ) -> Path:
     """
     Download a file from a URL with Google Drive interstitial handling.
     Skips download if the file already exists and passes size validation.
+
+    If a download hits Google Drive quota and resolve_alt_url is provided,
+    it will be called to get a fresh download URL from a different API
+    endpoint (which may point to a different Drive file copy with fresh quota).
+
+    resolve_alt_url: callable(endpoint_index) -> str|None
+        Returns a fresh download URL for the same logical file from a
+        different API endpoint, or None if no more endpoints.
     """
     out_path = Path(out_dir) / filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,91 +277,96 @@ def download_file(
             print(f"  [cache] {filename} exists but looks corrupt ({size} B) — re-downloading.")
             out_path.unlink()
 
-    session = requests.Session()
+    # Build list of URLs to try: original + alternatives from other endpoints
+    urls_to_try = [url]
+    if resolve_alt_url:
+        from shared.api_config import get_all_endpoints
+        for idx in range(len(get_all_endpoints())):
+            alt = resolve_alt_url(idx)
+            if alt and alt != url and alt not in urls_to_try:
+                urls_to_try.append(alt)
+
     last_error: Optional[Exception] = None
+    global _quota_latched
 
-    for attempt in range(1, attempts + 1):
-        try:
-            print(f"  [dl] Attempt {attempt}/{attempts}: {filename}")
-            response = session.get(url, stream=True, timeout=120)
-            response.raise_for_status()
-
-            if _looks_like_html(response):
-                html = response.text
-
-                # Detect Google Drive quota/error pages
-                if "quota" in html.lower() or "can&#39;t view or download" in html.lower():
-                    raise RuntimeError(
-                        f"Google Drive quota exceeded for {filename}. "
-                        f"Try again later or use a different Google account."
-                    )
-
-                confirm_url, confirm_params = _extract_confirm_url(
-                    html, response.url
-                )
-                if not confirm_url:
-                    raise RuntimeError(
-                        "Received HTML instead of file; could not extract confirm URL."
-                    )
-                response.close()
-                response = session.get(
-                    confirm_url, params=confirm_params, stream=True, timeout=120
-                )
-                response.raise_for_status()
-
-                # Check again after confirm redirect
-                if _looks_like_html(response):
-                    error_text = response.text[:500]
-                    raise RuntimeError(
-                        f"Still received HTML after confirm redirect: {error_text[:200]}"
-                    )
-
-            total = int(response.headers.get("content-length", 0))
-            written = 0
-
-            with open(out_path, "wb") as f, tqdm(
-                total=total if total > 0 else None,
-                unit="B",
-                unit_scale=True,
-                desc=filename,
-            ) as bar:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    written += len(chunk)
-                    bar.update(len(chunk))
-
-            response.close()
-
-            if total > 0 and written != total:
-                raise IOError(
-                    f"Incomplete download: expected {total} B, got {written} B"
-                )
-
-            # Post-download validation for PCAPs
-            if is_pcap and written < _MIN_PCAP_SIZE:
-                raise RuntimeError(
-                    f"Downloaded PCAP is too small ({written} B) — likely an error page."
-                )
-
-            print(f"  [dl] Saved → {out_path}")
-            return out_path
-
-        except Exception as exc:
-            last_error = exc
-            print(f"  [dl] Attempt {attempt} failed: {exc}")
-            if out_path.exists():
+    # ── If quota latch is set, skip all public links ─────────────────
+    if _quota_latched:
+        pass  # fall through to authenticated API below
+    else:
+        for url_idx, try_url in enumerate(urls_to_try):
+            if url_idx > 0:
+                print(f"  [dl] Trying endpoint {url_idx + 1}/{len(urls_to_try)} for {filename}")
+            for attempt in range(1, attempts + 1):
                 try:
-                    out_path.unlink()
-                except Exception:
-                    pass
-            if attempt < attempts:
-                print("  [dl] Retrying…")
+                    print(f"  [dl] Attempt {attempt}/{attempts}: {filename}")
+                    _try_download_url(try_url, out_path, filename, is_pcap, chunk_size)
+                    print(f"  [dl] Saved → {out_path}")
+                    return out_path
+
+                except Exception as exc:
+                    last_error = exc
+                    print(f"  [dl] Attempt {attempt} failed: {exc}")
+                    if out_path.exists():
+                        try:
+                            out_path.unlink()
+                        except Exception:
+                            pass
+
+                    # On quota error, latch and skip all public links
+                    if "quota" in str(exc).lower():
+                        if not _quota_latched:
+                            _quota_latched = True
+                            print("  [dl] Quota hit — switching to authenticated API for all downloads")
+                        break
+
+                    if attempt < attempts:
+                        print("  [dl] Retrying…")
+
+    # ── Authenticated Drive API download ─────────────────────────────
+    all_file_ids = set()
+    for try_url in urls_to_try:
+        fid = _extract_drive_file_id(try_url)
+        if fid:
+            all_file_ids.add(fid)
+
+    for fid in all_file_ids:
+        print(f"  [dl] Trying authenticated Drive API for {filename} (id={fid[:15]}...)")
+        if _try_authenticated_download(fid, out_path, filename):
+            # Validate
+            if out_path.exists():
+                size = out_path.stat().st_size
+                if size > 0 and (not is_pcap or size > _MIN_PCAP_SIZE):
+                    print(f"  [dl] Saved → {out_path}")
+                    return out_path
+                else:
+                    out_path.unlink(missing_ok=True)
 
     raise RuntimeError(
-        f"Download failed after {attempts} attempts"
+        f"Download failed for {filename} after trying {len(urls_to_try)} endpoint(s) + API"
     ) from last_error
+
+
+def _make_alt_resolver(api_params: dict, url_extractor) -> Any:
+    """
+    Build a resolve_alt_url callback for download_file.
+
+    api_params  : params to send to each API endpoint (e.g. {"action": "alerts", "day": "..."})
+    url_extractor : callable(response_json) -> str|None  — extracts the download URL from the response
+
+    Returns a function(endpoint_index) -> str|None that queries each
+    API endpoint for an alternative Drive file URL.
+    """
+    def resolver(ep_idx):
+        from shared.api_config import get_all_endpoints
+        eps = get_all_endpoints()
+        if ep_idx >= len(eps):
+            return None
+        try:
+            r = requests.get(eps[ep_idx], params=api_params, timeout=30)
+            return url_extractor(r.json())
+        except Exception:
+            return None
+    return resolver
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -304,8 +454,15 @@ def ingest_day(
             alerts_meta["downloadUrl"],
             "alerts.ndjson",
             str(day_dir),
+            resolve_alt_url=_make_alt_resolver(
+                {"action": "alerts", "day": day},
+                lambda j: j.get("file", {}).get("downloadUrl"),
+            ),
         )
         alerts_path = str(p)
+        dm = get_disk_manager()
+        if dm:
+            dm.register(str(p), ALERT, day)
     else:
         print("  [!] No alerts file found for this day.")
 
@@ -323,8 +480,15 @@ def ingest_day(
                 meta["downloadUrl"],
                 name,
                 str(day_dir / "zeek"),
+                resolve_alt_url=_make_alt_resolver(
+                    {"action": "zeek_file", "day": day, "dataset": name},
+                    lambda j: j.get("file", {}).get("downloadUrl"),
+                ),
             )
             zeek_files[name] = str(p)
+            dm = get_disk_manager()
+            if dm:
+                dm.register(str(p), ZEEK, day)
     else:
         print("\n[2/3] Skipping Zeek downloads (skip_zeek=True).")
 
@@ -341,7 +505,17 @@ def ingest_day(
         chosen["downloadUrl"],
         chosen["name"],
         str(day_dir / "pcap"),
+        resolve_alt_url=_make_alt_resolver(
+            {"action": "pcaps", "day": day},
+            lambda j: j.get("pcaps", [{}])[min(pcap_index, len(j.get("pcaps", [{}])) - 1)].get("downloadUrl"),
+        ),
     )
+    dm = get_disk_manager()
+    if dm:
+        dm.register(str(pcap_path), PCAP, day)
+    prov = get_provenance()
+    if prov:
+        prov.record_pcap(day, chosen.get("name", ""), str(pcap_path), chosen.get("size", 0))
 
     ctx = ZeekContext(
         day=day,
@@ -490,8 +664,17 @@ def ingest_all_alerts(
         alerts_path: Optional[str] = None
         alerts_meta = get_alerts_metadata(day)
         if alerts_meta.get("downloadUrl"):
-            p = download_file(alerts_meta["downloadUrl"], "alerts.ndjson", str(day_dir))
+            p = download_file(
+                alerts_meta["downloadUrl"], "alerts.ndjson", str(day_dir),
+                resolve_alt_url=_make_alt_resolver(
+                    {"action": "alerts", "day": day},
+                    lambda j: j.get("file", {}).get("downloadUrl"),
+                ),
+            )
             alerts_path = str(p)
+            dm = get_disk_manager()
+            if dm:
+                dm.register(str(p), ALERT, day)
             print(f"  ✓")
         else:
             print(f"  [!] No alerts file")
@@ -533,10 +716,23 @@ def download_zeek_for_days(
             if name not in available:
                 continue
             meta = available[name]
-            p = download_file(meta["downloadUrl"], name, str(day_dir / "zeek"))
+
+            p = download_file(
+                meta["downloadUrl"], name, str(day_dir / "zeek"),
+                resolve_alt_url=_make_alt_resolver(
+                    {"action": "zeek_file", "day": day, "dataset": name},
+                    lambda j: j.get("file", {}).get("downloadUrl"),
+                ),
+            )
             zeek_files[name] = str(p)
+            dm = get_disk_manager()
+            if dm:
+                dm.register(str(p), ZEEK, day)
 
         result[day] = zeek_files
+        prov = get_provenance()
+        if prov:
+            prov.record_zeek_files(day, list(zeek_files.keys()))
         print(f"    ✓ {len(zeek_files)} Zeek files")
 
     print(f"\n  ✓ Phase 3b complete: Zeek logs for {len(result)} days")
@@ -766,8 +962,21 @@ def download_selected_pcaps(
                     chosen["downloadUrl"],
                     chosen["name"],
                     str(day_dir),
+                    resolve_alt_url=_make_alt_resolver(
+                        {"action": "pcaps", "day": day},
+                        lambda j, _idx=idx: (
+                            j.get("pcaps", [{}])[min(_idx, len(j.get("pcaps", [{}])) - 1)].get("downloadUrl")
+                            if j.get("pcaps") else None
+                        ),
+                    ),
                 )
                 day_paths.append(str(p))
+                dm = get_disk_manager()
+                if dm:
+                    dm.register(str(p), PCAP, day)
+                prov = get_provenance()
+                if prov:
+                    prov.record_pcap(day, chosen.get("name", ""), str(p), chosen.get("size", 0))
             except RuntimeError as exc:
                 print(f"  [!] Skipping {chosen.get('name')}: {exc}")
 

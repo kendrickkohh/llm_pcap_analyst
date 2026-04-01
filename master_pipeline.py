@@ -67,6 +67,15 @@ from shared.pcap_api import (                           # noqa: E402
     download_selected_pcaps,
     download_zeek_for_days,
 )
+from shared.disk_manager import (                       # noqa: E402
+    init_disk_manager,
+    get_disk_manager,
+    init_provenance,
+    get_provenance,
+    ALERT,
+    ZEEK,
+    PCAP,
+)
 
 from agents.initial_access_adapter import initial_access_agent_node    # noqa: E402
 from agents.lateral_movement_adapter import lateral_movement_agent_node  # noqa: E402
@@ -158,7 +167,21 @@ def ingest_node(state: PipelineState) -> dict[str, Any]:
     """
     Downloads Zeek logs and the PCAP for the target day via the SC4063 API.
     Populates state["zeek_context"] and state["pcap_file"].
+
+    In --all-days mode the multi-day orchestrator pre-populates
+    zeek_context and pcap_file, then marks "ingest" as completed.
+    When that has happened we must NOT re-run ingest_day() because
+    a redundant API call could return fewer datasets (rate-limiting)
+    and overwrite the zeek_context with incomplete data.
     """
+    # ── Skip if already completed (multi-day mode) ────────────────────────
+    completed = state.get("completed_agents", [])
+    if "ingest" in completed and state.get("zeek_context"):
+        print(f"\n{'═' * 60}")
+        print(f"  [Ingest] Already completed — skipping redundant ingestion")
+        print(f"{'═' * 60}")
+        return {**state}
+
     day = state["target_day"]
     work_dir = state.get("work_dir", "data")
 
@@ -167,6 +190,16 @@ def ingest_node(state: PipelineState) -> dict[str, Any]:
     print(f"{'═' * 60}")
 
     ctx = ingest_day(day=day, work_dir=work_dir)
+
+    # Record provenance for single-day ingestion
+    prov = get_provenance()
+    if prov:
+        prov.record_day_analysed(day)
+        prov.record_pcap(
+            day, Path(ctx.pcap_path).name, ctx.pcap_path,
+            ctx.pcap_metadata.get("size", 0),
+        )
+        prov.record_zeek_files(day, list(ctx.zeek_files.keys()))
 
     messages = list(state.get("messages", []))
     messages.append(
@@ -444,6 +477,18 @@ Writing style:
 - Separate facts from analyst interpretation.
 - Keep recommendations actionable and prioritized.
 
+CRITICAL Markdown formatting rules:
+- Table cells MUST be single-line. NEVER put line breaks, bullet points, or
+  multi-line content inside a table cell. If a cell needs multiple items,
+  separate them with semicolons or commas on ONE line.
+  WRONG: | Evidence |\n| - item1\n- item2 |
+  RIGHT: | Evidence |\n| item1; item2; item3 |
+- Each table row must be exactly ONE line of text.
+- Use the correct number of column separators (|) — every row must have the
+  same number of | characters as the header row.
+- For detailed evidence that doesn't fit in a table, use a bullet list BELOW
+  the table under a "Supporting Evidence:" sub-heading instead.
+
 Return ONLY the Markdown report. No preamble, no JSON wrapping.\
 """
 
@@ -502,10 +547,15 @@ Now write the complete incident report as Markdown.
         azure_deployment=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
         api_version="2024-02-01",
         temperature=0.1,
-        max_tokens=6000,
+        max_tokens=16000,
     )
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
+
+    # Append provenance appendix if tracking is enabled
+    prov = get_provenance()
+    if prov and prov.enabled:
+        report_content += "\n\n" + prov.to_markdown()
 
     # Save both to project directory under reports/<run_id>/
     run_id = state.get("run_id", "unknown")
@@ -607,10 +657,15 @@ def write_combined_report(
         azure_deployment=os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
         api_version="2024-02-01",
         temperature=0.1,
-        max_tokens=8000,
+        max_tokens=16000,
     )
     response = report_llm.invoke([HumanMessage(content=report_prompt)])
     report_content = response.content
+
+    # Append provenance appendix if tracking is enabled
+    prov = get_provenance()
+    if prov and prov.enabled:
+        report_content += "\n\n" + prov.to_markdown()
 
     run_dir = _REPO_ROOT / "reports" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -627,150 +682,541 @@ def write_combined_report(
     return report_content
 
 
+def _checkpoint_path(work_dir: str) -> Path:
+    return Path(work_dir) / ".pipeline_checkpoint.json"
+
+
+def _save_checkpoint(
+    work_dir: str,
+    scoring: dict,
+    chosen_pcaps: list[dict],
+    chosen_days: list[str],
+    all_day_results: list[dict],
+    all_logs: dict,
+    *,
+    drilldown_days: list[str] | None = None,
+    sweep_done: bool = False,
+):
+    """Persist pipeline state so a crashed run can resume."""
+    cp = {
+        "scoring": scoring,
+        "chosen_pcaps": chosen_pcaps,
+        "chosen_days": chosen_days,
+        "completed_days": [r["day"] for r in all_day_results],
+        "all_day_results": all_day_results,
+        "drilldown_days": drilldown_days or [],
+        "sweep_done": sweep_done,
+        "all_logs": all_logs,
+    }
+    # Also checkpoint provenance
+    prov = get_provenance()
+    if prov:
+        cp["provenance"] = prov.to_dict()
+    path = _checkpoint_path(work_dir)
+    path.write_text(json.dumps(cp, indent=2, default=str), encoding="utf-8")
+    print(f"  [checkpoint] Saved — {len(cp['completed_days'])} day(s) complete")
+
+
+def _load_checkpoint(work_dir: str) -> dict | None:
+    path = _checkpoint_path(work_dir)
+    if not path.exists():
+        return None
+    try:
+        cp = json.loads(path.read_text(encoding="utf-8"))
+        if cp.get("completed_days"):
+            print(f"  [checkpoint] Found — {len(cp['completed_days'])} day(s) already complete: "
+                  f"{', '.join(cp['completed_days'])}")
+        return cp
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+
+def _zeek_triage_initial_access(zeek_files: dict[str, str], day: str) -> dict:
+    """
+    Fast Zeek-based initial access triage — no LLM, no tshark.
+
+    Scans Zeek RDP and connection logs to detect brute-force campaigns and
+    identify the most likely successful login session (largest byte count).
+    Returns a partial InitialAccessFindings dict.
+    """
+    import json
+    from pathlib import Path
+    from shared.ecs_compat import normalize_record
+
+    RFC1918 = ("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+               "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+               "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")
+
+    def _is_internal(ip: str) -> bool:
+        return any(ip.startswith(p) for p in RFC1918)
+
+    rdp_path = zeek_files.get("zeek.rdp.ndjson")
+    conn_path = zeek_files.get("zeek.connection.ndjson")
+
+    brute_force_count = 0
+    unique_sources: set[str] = set()
+    patient_zero = None
+    attacker_ip = None
+    best_session_bytes = 0
+    best_session_ts = ""
+
+    # Scan RDP log for external connection count
+    if rdp_path and Path(rdp_path).exists():
+        with open(rdp_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = normalize_record(json.loads(line))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                src = rec.get("id.orig_h", "")
+                if src and not _is_internal(src):
+                    brute_force_count += 1
+                    unique_sources.add(src)
+
+    # Scan connection log for largest RDP session (likely successful login)
+    if conn_path and Path(conn_path).exists():
+        with open(conn_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = normalize_record(json.loads(line))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if rec.get("id.resp_p") != 3389:
+                    continue
+                orig_bytes = int(rec.get("orig_bytes") or 0)
+                resp_bytes = int(rec.get("resp_bytes") or 0)
+                total = orig_bytes + resp_bytes
+                if total > best_session_bytes:
+                    best_session_bytes = total
+                    attacker_ip = rec.get("id.orig_h", "")
+                    patient_zero = rec.get("id.resp_h", "")
+                    best_session_ts = rec.get("ts", "")
+
+    # If best session attacker is internal, it might be lateral movement
+    if attacker_ip and _is_internal(attacker_ip):
+        attacker_ip = None
+
+    summary = (
+        f"[Zeek triage {day}] {brute_force_count} external RDP attempts from "
+        f"{len(unique_sources)} unique IPs"
+    )
+    if best_session_bytes > 10000:
+        summary += f"; largest session {best_session_bytes:,} bytes from {attacker_ip}"
+
+    return {
+        "summary": summary,
+        "patient_zero": patient_zero,
+        "attacker_ip": attacker_ip,
+        "attack_vector": "brute force" if brute_force_count > 100 else None,
+        "exposed_service": "RDP/3389" if brute_force_count > 0 else None,
+        "brute_force_count": brute_force_count,
+        "successful_session_bytes": best_session_bytes if best_session_bytes > 10000 else None,
+        "session_start": best_session_ts,
+        "report_markdown": summary,
+    }
+
+
+def _needs_pcap_drilldown(day_result: dict, day_alert_count: int) -> tuple[bool, str]:
+    """
+    Determine if a day needs PCAP drill-down based on Zeek sweep findings.
+    Errs on the side of caution — drills down if ANYTHING looks suspicious.
+    """
+    reasons: list[str] = []
+
+    ia = day_result.get("initial_access_findings", {})
+    lm = day_result.get("lateral_movement_findings", {})
+    ex = day_result.get("exfiltration_findings", {})
+
+    if ia.get("successful_session_bytes") and ia["successful_session_bytes"] > 10000:
+        reasons.append(f"successful RDP session ({ia['successful_session_bytes']:,} bytes)")
+
+    if ia.get("brute_force_count", 0) > 1000:
+        reasons.append(f"heavy brute-force ({ia['brute_force_count']:,} attempts)")
+
+    lm_observed = lm.get("observed", [])
+    lm_hosts = lm.get("compromised_hosts", [])
+    if lm_observed or lm_hosts:
+        reasons.append(f"lateral movement detected ({len(lm_hosts)} hosts)")
+
+    if ex.get("detected"):
+        reasons.append("exfiltration detected")
+
+    if day_alert_count > 50:
+        reasons.append(f"{day_alert_count} alerts")
+
+    if reasons:
+        return True, "; ".join(reasons)
+    return False, "no significant findings"
+
+
 def run_all_days_pipeline(
     pipeline: Any,
     work_dir: str,
 ) -> list[dict]:
     """
-    Two-phase ingestion + human-in-the-loop PCAP selection + per-day analysis:
+    Two-pass architecture: Zeek sweep → targeted PCAP drill-down.
 
-    Phase 1: Download Zeek + Suricata logs for all days (lightweight)
-    Phase 2: Score alerts across all days, rank all PCAPs globally
-    HITL:    Present ranked PCAPs to user, user picks how many to ingest
-    Phase 3: Download chosen PCAPs
-    Phase 4: Run agent pipeline per day with pre-downloaded data
+    Pass 1 (Zeek Sweep): Download Zeek + alerts for ALL days. Run
+        lateral_movement + exfiltration (Zeek-based) plus a fast Zeek
+        initial access triage.  No PCAPs downloaded — fast and lossless.
 
-    Returns accumulated per-day findings for the final combined report.
+    Pass 2 (PCAP Drill-down): For days flagged as suspicious by Pass 1,
+        download 1 PCAP and run initial_access (tshark) + payload agents.
+
+    Every day is checked.  No day is skipped.  PCAPs are only downloaded
+    when Zeek + alerts indicate something worth investigating deeper.
+
+    Sliding window: at most 1 day's Zeek + 1 PCAP on disk at a time.
     """
     from shared.data_contract import ZeekContext
 
-    # ── Phase 1: Download alerts only (lightweight, ~600 MB) ────────────
-    all_logs = ingest_all_alerts(work_dir=work_dir)
+    # ── Check for existing checkpoint ─────────────────────────────────────
+    checkpoint = _load_checkpoint(work_dir)
 
-    # ── Phase 2: Score alerts across all days ─────────────────────────────
-    print(f"\n{'═' * 60}")
-    print(f"  Phase 2: Scoring alerts across {len(all_logs)} days")
-    print(f"{'═' * 60}")
-    scoring = score_alerts(all_logs)
+    if checkpoint and checkpoint.get("completed_days"):
+        scoring = checkpoint["scoring"]
+        all_day_results = checkpoint["all_day_results"]
+        all_logs = checkpoint.get("all_logs", {})
+        completed_set = set(checkpoint["completed_days"])
+        drilldown_days = checkpoint.get("drilldown_days", [])
+        sweep_done = checkpoint.get("sweep_done", False)
 
-    suspect_ips = scoring.get("suspect_ips", [])
-    print(f"\n  Top suspect IPs:")
-    for s in suspect_ips[:5]:
-        print(f"    {s['ip']:20s}  score={s['score']:6d}  "
-              f"({s['alert_count']} alerts)  {s['top_signatures'][0][:60]}")
+        prov = get_provenance()
+        if prov and checkpoint.get("provenance"):
+            from shared.disk_manager import ProvenanceLog
+            restored = ProvenanceLog.from_dict(checkpoint["provenance"])
+            prov.pcaps = restored.pcaps
+            prov.zeek_files = restored.zeek_files
+            prov.agent_sources = restored.agent_sources
+            prov.days_analysed = restored.days_analysed
 
-    # ── Phase 2b: Rank all PCAPs globally ─────────────────────────────────
-    print(f"\n{'═' * 60}")
-    print(f"  Phase 2b: Scoring all PCAPs across all days")
-    print(f"{'═' * 60}")
-    ranked_pcaps = score_all_pcaps(scoring)
+        suspect_ips = scoring.get("suspect_ips", [])
+        all_days = sorted(all_logs.keys())
 
-    if not ranked_pcaps:
-        raise RuntimeError("No PCAPs with suspect activity found across any day.")
+        print(f"\n{'═' * 60}")
+        print(f"  Resuming from checkpoint — {len(completed_set)} day(s) done, sweep_done={sweep_done}")
+        print(f"{'═' * 60}")
 
-    # ── HITL: Present ranked PCAPs to user ────────────────────────────────
-    print(f"\n{'═' * 60}")
-    print(f"  Ranked PCAPs by suspect alert density ({len(ranked_pcaps)} with activity)")
-    print(f"{'═' * 60}")
-    print(f"  {'Rank':<6}{'Day':<14}{'PCAP':<8}{'Score':<10}{'Size':<10}{'Name'}")
-    print(f"  {'─'*6}{'─'*14}{'─'*8}{'─'*10}{'─'*10}{'─'*40}")
-    for i, p in enumerate(ranked_pcaps):
-        print(f"  {i+1:<6}{p['day']:<14}[{p['pcap_index']}]{'':<5}"
-              f"{p['score']:<10}{p['size_mb']:<10.0f}{p['pcap_name'][:40]}")
+    else:
+        completed_set = set()
+        all_day_results = []
+        drilldown_days = []
+        sweep_done = False
 
-    total_mb = sum(p["size_mb"] for p in ranked_pcaps)
-    print(f"\n  Total if all selected: {len(ranked_pcaps)} PCAPs, {total_mb:.0f} MB")
+        # ── Phase 1: Download alerts (lightweight) ───────────────────────
+        all_logs = ingest_all_alerts(work_dir=work_dir)
 
-    while True:
-        user_input = input(f"\n  How many PCAPs to ingest? (1-{len(ranked_pcaps)}, or 'all'): ").strip()
-        if user_input.lower() == "all":
-            n_chosen = len(ranked_pcaps)
-            break
-        try:
-            n_chosen = int(user_input)
-            if 1 <= n_chosen <= len(ranked_pcaps):
-                break
-            print(f"  Please enter a number between 1 and {len(ranked_pcaps)}.")
-        except ValueError:
-            print(f"  Please enter a number or 'all'.")
+        # ── Phase 2: Score alerts ────────────────────────────────────────
+        print(f"\n{'═' * 60}")
+        print(f"  Phase 2: Scoring alerts across {len(all_logs)} days")
+        print(f"{'═' * 60}")
+        scoring = score_alerts(all_logs)
 
-    chosen_pcaps = ranked_pcaps[:n_chosen]
-    chosen_mb = sum(p["size_mb"] for p in chosen_pcaps)
-    chosen_days = sorted(set(p["day"] for p in chosen_pcaps))
-    print(f"\n  → Selected top {n_chosen} PCAPs ({chosen_mb:.0f} MB) across {len(chosen_days)} days")
+        suspect_ips = scoring.get("suspect_ips", [])
+        print(f"\n  Top suspect IPs:")
+        for s in suspect_ips[:5]:
+            print(f"    {s['ip']:20s}  score={s['score']:6d}  "
+                  f"({s['alert_count']} alerts)  {s['top_signatures'][0][:60]}")
 
-    # ── Phase 3a: Download selected PCAPs ─────────────────────────────────
-    pcap_paths = download_selected_pcaps(chosen_pcaps, work_dir=work_dir)
+        all_days = sorted(all_logs.keys())
 
-    # ── Phase 3b: Download Zeek logs only for selected days ───────────────
-    zeek_by_day = download_zeek_for_days(chosen_days, work_dir=work_dir)
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 1: ZEEK SWEEP — all days, no PCAPs
+    # ══════════════════════════════════════════════════════════════════════
 
-    # Merge Zeek files into all_logs
-    for day, zeek_files in zeek_by_day.items():
-        if day in all_logs:
+    if not sweep_done:
+        print(f"\n{'═' * 60}")
+        print(f"  Pass 1: Zeek Sweep — analysing {len(all_days)} days (no PCAPs)")
+        print(f"{'═' * 60}")
+
+        # Accumulate attack context across days for chronological correlation
+        rolling_attack_ctx: dict[str, Any] = {}
+
+        for i, day in enumerate(all_days):
+            sweep_tag = f"sweep:{day}"
+            if sweep_tag in completed_set:
+                for r in all_day_results:
+                    if r["day"] == day:
+                        rolling_attack_ctx.update(r.get("attack_context", {}))
+                print(f"\n  [{i+1}/{len(all_days)}] {day}: already swept (checkpoint)")
+                continue
+
+            print(f"\n{'─' * 60}")
+            print(f"  [{i+1}/{len(all_days)}] {day}: Zeek sweep")
+            print(f"{'─' * 60}")
+
+            # ── Evict previous day's data ────────────────────────────────
+            dm = get_disk_manager()
+            if dm:
+                dm.evict_to_budget()
+
+            # ── Download Zeek logs only ──────────────────────────────────
+            zeek_by_day = download_zeek_for_days([day], work_dir=work_dir)
+            zeek_files = zeek_by_day.get(day, {})
             all_logs[day]["zeek_files"] = zeek_files
 
-    # ── Phase 4: Run agent pipeline per day (only days with PCAPs) ───────
-    all_day_results: list[dict] = []
-    days = sorted(pcap_paths.keys())
+            dm = get_disk_manager()
+            if dm:
+                dm.evict_to_budget()
+                dm.print_status()
 
-    for i, day in enumerate(days):
-        print(f"\n{'=' * 60}")
-        print(f"  [Phase 4] Agent analysis: {day}  ({i+1}/{len(days)})")
-        print(f"{'=' * 60}")
+            if not zeek_files:
+                print(f"  [!] No Zeek files for {day} — skipping")
+                continue
 
-        day_pcaps = pcap_paths.get(day, [])
-        day_logs = all_logs[day]
+            ctx = ZeekContext(
+                day=day,
+                pcap_path="",
+                alerts_path=all_logs[day].get("alerts_path"),
+                zeek_files=zeek_files,
+            )
 
-        if not day_pcaps:
-            print(f"  [!] No PCAPs for {day} — skipping agent analysis")
-            continue
+            state = initial_pipeline_state(target_day=day, work_dir=work_dir)
+            state.update(set_zeek_context(state, ctx))
+            state["pcap_file"] = ""
+            state["alert_scoring"] = scoring
+            state["attack_context"] = dict(rolling_attack_ctx)
 
-        # Use the first selected PCAP as the primary (agents use pcap_file)
-        primary_pcap = day_pcaps[0]
+            # ── Zeek triage: fast initial access detection ───────────────
+            print(f"  [IA triage] Scanning Zeek RDP + conn logs…")
+            ia_findings = _zeek_triage_initial_access(zeek_files, day)
+            state["initial_access_findings"] = ia_findings
 
-        # Build ZeekContext from pre-downloaded data
-        ctx = ZeekContext(
-            day=day,
-            pcap_path=primary_pcap,
-            alerts_path=day_logs.get("alerts_path"),
-            zeek_files=day_logs.get("zeek_files", {}),
+            if ia_findings.get("patient_zero"):
+                state["attack_context"]["patient_zero"] = ia_findings["patient_zero"]
+            if ia_findings.get("attacker_ip"):
+                state["attack_context"].setdefault("attacker_ips", [])
+                if ia_findings["attacker_ip"] not in state["attack_context"]["attacker_ips"]:
+                    state["attack_context"]["attacker_ips"].append(ia_findings["attacker_ip"])
+
+            print(f"    {ia_findings['summary']}")
+
+            # ── Run lateral_movement agent (Zeek-based) ──────────────────
+            print(f"  [LM] Running lateral movement agent…")
+            lm_result = lateral_movement_agent_node(state)
+            state.update(lm_result)
+
+            # ── Run exfiltration agent (Zeek-based) ──────────────────────
+            print(f"  [Exfil] Running exfiltration agent…")
+            exfil_result = exfiltration_agent_node(state)
+            state.update(exfil_result)
+
+            # ── Run payload agent (Zeek-based) ───────────────────────────
+            print(f"  [Payload] Running payload agent…")
+            payload_result = payload_agent_node(state)
+            state.update(payload_result)
+
+            # ── MITRE enrichment ─────────────────────────────────────────
+            mitre_result = mitre_enrichment_node(state)
+            state.update(mitre_result)
+
+            # ── Update rolling attack context ────────────────────────────
+            rolling_attack_ctx.update(state.get("attack_context", {}))
+
+            # ── Collect results ──────────────────────────────────────────
+            agent_zeek_ctx = state.get("zeek_context", {})
+
+            day_result = {
+                "day": day,
+                "pass": "zeek_sweep",
+                "attack_context":             state.get("attack_context", {}),
+                "initial_access_findings":    state.get("initial_access_findings", {}),
+                "lateral_movement_findings":  state.get("lateral_movement_findings", {}),
+                "exfiltration_findings":      state.get("exfiltration_findings", {}),
+                "payload_findings":           state.get("payload_findings", {}),
+                "mitre_enrichment":           state.get("mitre_enrichment", {}),
+                "iocs":                       merge_all_iocs(state),
+                "pcap_files":                 [],
+                "alert_scoring_summary": {
+                    "suspect_ips": suspect_ips[:5],
+                    "day_alerts": scoring.get("per_day", {}).get(day, {}).get("total_alerts", 0),
+                },
+                "data_diagnostics": {
+                    "zeek_context": agent_zeek_ctx,
+                    "pcap_file_used": "",
+                    "pcap_file_existed": False,
+                },
+            }
+            all_day_results.append(day_result)
+            completed_set.add(sweep_tag)
+
+            # ── Determine drill-down ─────────────────────────────────────
+            day_alerts = scoring.get("per_day", {}).get(day, {}).get("total_alerts", 0)
+            needs_drill, reason = _needs_pcap_drilldown(day_result, day_alerts)
+            if needs_drill:
+                drilldown_days.append(day)
+                print(f"  [→ PCAP drill-down needed: {reason}]")
+            else:
+                print(f"  [→ No PCAP drill-down needed: {reason}]")
+
+            # ── Provenance ───────────────────────────────────────────────
+            prov = get_provenance()
+            if prov:
+                prov.record_day_analysed(day)
+                prov.record_zeek_files(day, list(zeek_files.keys()))
+                prov.record_agent_access(day, "lateral_movement", list(zeek_files.values()))
+                prov.record_agent_access(day, "exfiltration", list(zeek_files.values()))
+
+            # ── Release Zeek for this day ────────────────────────────────
+            dm = get_disk_manager()
+            if dm:
+                dm.release_day(day, artifact_types=[ALERT, ZEEK])
+                dm.evict_to_budget()
+
+            # ── Checkpoint ───────────────────────────────────────────────
+            _save_checkpoint(
+                work_dir, scoring, [], all_days,
+                all_day_results, all_logs,
+                drilldown_days=drilldown_days, sweep_done=False,
+            )
+
+        sweep_done = True
+        print(f"\n{'═' * 60}")
+        print(f"  Pass 1 complete: {len(all_days)} days swept")
+        print(f"  Drill-down needed: {len(drilldown_days)} days → {drilldown_days}")
+        print(f"{'═' * 60}")
+
+        _save_checkpoint(
+            work_dir, scoring, [], all_days,
+            all_day_results, all_logs,
+            drilldown_days=drilldown_days, sweep_done=True,
         )
 
-        # Create state with pre-populated ingestion data
-        state = initial_pipeline_state(target_day=day, work_dir=work_dir)
-        state.update(set_zeek_context(state, ctx))
-        state["pcap_file"] = primary_pcap
-        state["pcap_files"] = day_pcaps
-        state["alert_scoring"] = scoring
-        state["completed_agents"] = ["ingest"]  # skip ingest node
+    # ══════════════════════════════════════════════════════════════════════
+    # PASS 2: PCAP DRILL-DOWN — targeted days only
+    # ══════════════════════════════════════════════════════════════════════
 
-        # Run the pipeline (ingest already done, starts at supervisor)
-        final_day_state: dict[str, Any] = {}
-        for step_state in pipeline.stream(state):
-            node_name = list(step_state.keys())[0]
-            node_data = step_state[node_name]
-            completed = node_data.get("completed_agents", [])
-            print(f"    ✓ {node_name}  |  completed: {completed}")
-            final_day_state.update(node_data)
+    if drilldown_days:
+        print(f"\n{'═' * 60}")
+        print(f"  Pass 2: PCAP Drill-down — {len(drilldown_days)} days")
+        print(f"{'═' * 60}")
 
-        all_day_results.append({
-            "day": day,
-            "attack_context":             final_day_state.get("attack_context", {}),
-            "initial_access_findings":    final_day_state.get("initial_access_findings", {}),
-            "lateral_movement_findings":  final_day_state.get("lateral_movement_findings", {}),
-            "exfiltration_findings":      final_day_state.get("exfiltration_findings", {}),
-            "payload_findings":           final_day_state.get("payload_findings", {}),
-            "mitre_enrichment":           final_day_state.get("mitre_enrichment", {}),
-            "iocs":                       merge_all_iocs(final_day_state),  # type: ignore[arg-type]
-            "pcap_files":                 day_pcaps,
-            "alert_scoring_summary": {
-                "suspect_ips": suspect_ips[:5],
-                "day_alerts": scoring.get("per_day", {}).get(day, {}).get("total_alerts", 0),
-            },
-        })
+        ranked_pcaps = score_all_pcaps(scoring)
+        best_pcap_per_day: dict[str, dict] = {}
+        for p in ranked_pcaps:
+            if p["day"] not in best_pcap_per_day:
+                best_pcap_per_day[p["day"]] = p
+
+        for i, day in enumerate(drilldown_days):
+            drill_tag = f"drill:{day}"
+            if drill_tag in completed_set:
+                print(f"\n  [{i+1}/{len(drilldown_days)}] {day}: drill-down already complete")
+                continue
+
+            day_idx = next(
+                (j for j, r in enumerate(all_day_results) if r["day"] == day), None
+            )
+            if day_idx is None:
+                continue
+
+            print(f"\n{'─' * 60}")
+            print(f"  [{i+1}/{len(drilldown_days)}] {day}: PCAP drill-down")
+            print(f"{'─' * 60}")
+
+            dm = get_disk_manager()
+            if dm:
+                dm.evict_to_budget()
+
+            # ── Download best PCAP for this day ──────────────────────────
+            pcap_entry = best_pcap_per_day.get(day)
+            if not pcap_entry:
+                print(f"  [!] No ranked PCAP for {day} — skipping drill-down")
+                continue
+
+            day_pcap_paths = download_selected_pcaps([pcap_entry], work_dir=work_dir)
+            day_pcaps = day_pcap_paths.get(day, [])
+            if not day_pcaps:
+                print(f"  [!] PCAP download failed for {day} — skipping")
+                continue
+
+            primary_pcap = day_pcaps[0]
+
+            # ── Re-download Zeek for initial_access seed queries ─────────
+            zeek_by_day = download_zeek_for_days([day], work_dir=work_dir)
+            zeek_files = zeek_by_day.get(day, {})
+
+            dm = get_disk_manager()
+            if dm:
+                dm.evict_to_budget()
+
+            # ── Build state from Pass 1 results ──────────────────────────
+            existing = all_day_results[day_idx]
+            ctx = ZeekContext(
+                day=day,
+                pcap_path=primary_pcap,
+                alerts_path=all_logs.get(day, {}).get("alerts_path"),
+                zeek_files=zeek_files,
+            )
+
+            state = initial_pipeline_state(target_day=day, work_dir=work_dir)
+            state.update(set_zeek_context(state, ctx))
+            state["pcap_file"] = primary_pcap
+            state["pcap_files"] = day_pcaps
+            state["alert_scoring"] = scoring
+            state["attack_context"] = existing.get("attack_context", {})
+            state["lateral_movement_findings"] = existing.get("lateral_movement_findings", {})
+            state["exfiltration_findings"] = existing.get("exfiltration_findings", {})
+            state["completed_agents"] = ["ingest"]
+
+            # ── Run initial_access with PCAP (full tshark agent) ─────────
+            print(f"  [IA] Running initial access with PCAP…")
+            ia_result = initial_access_agent_node(state)
+            state.update(ia_result)
+
+            # ── Run payload agent with PCAP ──────────────────────────────
+            print(f"  [Payload] Running payload agent…")
+            payload_result = payload_agent_node(state)
+            state.update(payload_result)
+
+            # ── Re-run MITRE with combined findings ──────────────────────
+            mitre_result = mitre_enrichment_node(state)
+            state.update(mitre_result)
+
+            # ── Merge drill-down results into existing day entry ─────────
+            all_day_results[day_idx]["initial_access_findings"] = state.get("initial_access_findings", {})
+            all_day_results[day_idx]["payload_findings"] = state.get("payload_findings", {})
+            all_day_results[day_idx]["mitre_enrichment"] = state.get("mitre_enrichment", {})
+            all_day_results[day_idx]["attack_context"] = state.get("attack_context", {})
+            all_day_results[day_idx]["iocs"] = merge_all_iocs(state)
+            all_day_results[day_idx]["pcap_files"] = day_pcaps
+            all_day_results[day_idx]["pass"] = "drilldown_done"
+            all_day_results[day_idx]["data_diagnostics"]["pcap_file_used"] = primary_pcap
+            all_day_results[day_idx]["data_diagnostics"]["pcap_file_existed"] = Path(primary_pcap).exists()
+            completed_set.add(drill_tag)
+
+            # ── Provenance ───────────────────────────────────────────────
+            prov = get_provenance()
+            if prov:
+                prov.record_pcap(
+                    day, Path(primary_pcap).name, primary_pcap,
+                    pcap_entry.get("size_mb", 0) * 1e6,
+                )
+                prov.record_agent_access(day, "initial_access", [primary_pcap])
+                prov.record_agent_access(day, "payload", [primary_pcap])
+
+            # ── Release PCAP + Zeek immediately ──────────────────────────
+            dm = get_disk_manager()
+            if dm:
+                dm.release_day(day, artifact_types=[PCAP, ZEEK, ALERT])
+                dm.evict_to_budget()
+                dm.print_status()
+
+            # ── Checkpoint ───────────────────────────────────────────────
+            _save_checkpoint(
+                work_dir, scoring, [], all_days,
+                all_day_results, all_logs,
+                drilldown_days=drilldown_days, sweep_done=True,
+            )
 
     return all_day_results
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -885,9 +1331,30 @@ Examples:
         help="Skip ingestion and use this local PCAP path directly. "
              "Ignored when --all-days is used.",
     )
+    parser.add_argument(
+        "--no-provenance", action="store_true",
+        help="Disable PCAP/Zeek provenance tracking in the report.",
+    )
+    parser.add_argument(
+        "--disk-soft-gb", type=float, default=5.0,
+        help="Soft disk budget in GB (default: 5). Best-effort target.",
+    )
+    parser.add_argument(
+        "--disk-hard-gb", type=float, default=8.0,
+        help="Hard disk budget in GB (default: 8). Warns if exceeded.",
+    )
     args = parser.parse_args()
 
     t_start = time.time()
+
+    # ── Initialise disk budget manager + provenance ──────────────────────
+    _gb = 1 << 30
+    init_disk_manager(
+        args.work_dir,
+        soft_limit=int(args.disk_soft_gb * _gb),
+        hard_limit=int(args.disk_hard_gb * _gb),
+    )
+    init_provenance(enabled=not args.no_provenance)
 
     # ── All-days mode (two-phase ingestion + HITL) ──────────────────────
     if args.all_days:
@@ -910,6 +1377,19 @@ Examples:
             all_day_results, args.work_dir, run_id=run_id
         )
 
+        # ── Remove checkpoint on successful completion ────────────────────
+        cp_path = _checkpoint_path(args.work_dir)
+        if cp_path.exists():
+            cp_path.unlink()
+            print("  [checkpoint] Cleared — pipeline completed successfully")
+
+        # ── Final disk cleanup: release everything except reports ─────────
+        dm = get_disk_manager()
+        if dm:
+            dm.release_all()
+            dm.evict_to_budget()
+            print(f"  [disk] Final: {dm.usage_str()}")
+
         elapsed = time.time() - t_start
         run_dir = _REPO_ROOT / "reports" / run_id
         print(f"\n{'=' * 60}")
@@ -931,7 +1411,29 @@ Examples:
     # If a local PCAP is provided, skip ingestion
     if args.pcap:
         from shared.data_contract import ZeekContext
-        ctx = ZeekContext(day=args.day, pcap_path=os.path.abspath(args.pcap))
+        pcap_abs = os.path.abspath(args.pcap)
+
+        # Auto-discover Zeek files on disk next to the PCAP
+        zeek_files: dict[str, str] = {}
+        zeek_dir = Path(args.work_dir) / args.day / "zeek"
+        if zeek_dir.is_dir():
+            for f in zeek_dir.iterdir():
+                if f.suffix in (".ndjson", ".log") and f.stat().st_size > 0:
+                    zeek_files[f.name] = str(f.resolve())
+            if zeek_files:
+                print(f"  [pcap-mode] Auto-discovered {len(zeek_files)} Zeek files "
+                      f"in {zeek_dir}")
+
+        # Auto-discover alerts
+        alerts_path = Path(args.work_dir) / args.day / "alerts.ndjson"
+        alerts_str = str(alerts_path) if alerts_path.exists() else None
+
+        ctx = ZeekContext(
+            day=args.day,
+            pcap_path=pcap_abs,
+            alerts_path=alerts_str,
+            zeek_files=zeek_files,
+        )
         state.update(set_zeek_context(state, ctx))
         state["pcap_file"] = ctx.pcap_path
         state["completed_agents"] = ["ingest"]
@@ -965,14 +1467,39 @@ Examples:
 
     # ── Full single-day pipeline ───────────────────────────────────────────
     final_state = None
+    _prev_completed: list[str] = list(state.get("completed_agents", []))
     for step_state in pipeline.stream(state):
         node_name = list(step_state.keys())[0]
         node_data = step_state[node_name]
         completed = node_data.get("completed_agents", [])
         print(f"\n  ✓ Step complete: {node_name}  |  completed: {completed}")
 
+        # ── Record provenance for newly completed agents ──────────────
+        prov = get_provenance()
+        if prov:
+            new_agents = [a for a in completed if a not in _prev_completed and a != "ingest"]
+            zeek_ctx_d = node_data.get("zeek_context") or state.get("zeek_context") or {}
+            pcap_file = node_data.get("pcap_file") or state.get("pcap_file", "")
+            zeek_file_paths = list(zeek_ctx_d.get("zeek_files", {}).values())
+            for agent in new_agents:
+                if agent in ("initial_access", "payload"):
+                    sources = [pcap_file] if pcap_file else []
+                elif agent in ("lateral_movement", "exfiltration"):
+                    sources = zeek_file_paths
+                else:
+                    sources = []
+                if sources:
+                    prov.record_agent_access(args.day, agent, sources)
+            _prev_completed = list(completed)
+
         if "final_report" in node_data and node_data["final_report"]:
             final_state = node_data
+
+    # ── Disk cleanup after single-day analysis ───────────────────────────
+    dm = get_disk_manager()
+    if dm:
+        dm.release_all()
+        dm.evict_to_budget()
 
     elapsed = time.time() - t_start
 

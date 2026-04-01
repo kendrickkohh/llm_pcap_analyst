@@ -24,6 +24,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Annotated, Any, Optional, TypedDict
 
+from shared.ecs_compat import normalize_record
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI
@@ -94,7 +96,11 @@ def _run_tshark(args: list[str], timeout: int = 120) -> str:
 
 
 def _stream_zeek(zeek_path: str, max_lines: int = 50_000):
-    """Yield parsed NDJSON records from a Zeek log file."""
+    """Yield parsed NDJSON records from a Zeek log file.
+
+    Automatically normalises ECS/Filebeat records to standard Zeek
+    field names (id.orig_h, id.resp_h, ts, etc.).
+    """
     count = 0
     try:
         with open(zeek_path, "r", encoding="utf-8", errors="replace") as f:
@@ -103,7 +109,7 @@ def _stream_zeek(zeek_path: str, max_lines: int = 50_000):
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield normalize_record(json.loads(line))
                 except json.JSONDecodeError:
                     continue
                 count += 1
@@ -298,31 +304,79 @@ def kerberos_events(top_n: int = 20) -> str:
 @tool
 def dce_rpc_events(top_n: int = 20) -> str:
     """
-    Detect DCE/RPC calls for remote execution: SCM (service creation),
-    WMI (IWbemServices), DCOM, Task Scheduler — common PsExec / impacket artefacts.
+    Detect DCE/RPC calls for remote execution and account manipulation:
+    - SCM (service creation — PsExec / impacket)
+    - WMI (IWbemServices — remote query/execution)
+    - DCOM, Task Scheduler
+    - SAMR (user/group creation, modification, enumeration)
+    - LSARPC (policy and trust enumeration)
     """
     dce_path = _ZEEK_FILES.get("zeek.dce_rpc.ndjson")
+
+    # Operations that indicate attacker activity
+    SUSPICIOUS_OPS = {
+        # Account manipulation (SAMR)
+        "samr::SamrCreateUser2InDomain": "USER CREATION",
+        "samr::SamrSetInformationUser": "USER MODIFICATION",
+        "samr::SamrAddMemberToGroup": "GROUP MEMBERSHIP CHANGE",
+        "samr::SamrAddMemberToAlias": "ALIAS MEMBERSHIP CHANGE",
+        "samr::SamrDeleteUser": "USER DELETION",
+        "samr::SamrChangePasswordUser": "PASSWORD CHANGE",
+        # Remote execution
+        "svcctl::CreateServiceW": "SERVICE CREATION (PsExec-like)",
+        "svcctl::StartServiceW": "SERVICE START",
+        "IWbemServices::ExecQuery": "WMI QUERY",
+        "IWbemServices::ExecMethod": "WMI EXECUTION",
+        "IRemoteSCMActivator::RemoteCreateInstance": "DCOM ACTIVATION",
+        "ITaskSchedulerService::SchRpcRegisterTask": "SCHEDULED TASK CREATION",
+    }
 
     if dce_path and Path(dce_path).exists():
         events: list[dict] = []
         op_counter: Counter = Counter()
+        suspicious_events: list[dict] = []
+
         for rec in _stream_zeek(dce_path):
             src = rec.get("id.orig_h", "")
             dst = rec.get("id.resp_h", "")
             endpoint  = rec.get("endpoint", "")
             operation = rec.get("operation", "")
             if src and dst and _is_internal(src) and _is_internal(dst):
+                key = f"{endpoint}::{operation}"
                 events.append({
                     "src": src, "dst": dst,
                     "endpoint": endpoint, "operation": operation,
                     "ts": rec.get("ts", ""),
                 })
-                if endpoint:
-                    op_counter[f"{endpoint}::{operation}"] += 1
+                op_counter[key] += 1
+
+                # Flag suspicious operations
+                if key in SUSPICIOUS_OPS:
+                    suspicious_events.append({
+                        "src": src, "dst": dst,
+                        "endpoint": endpoint, "operation": operation,
+                        "category": SUSPICIOUS_OPS[key],
+                        "ts": rec.get("ts", ""),
+                    })
+                # Also flag samr enumeration (recon)
+                elif endpoint == "samr" and operation in (
+                    "SamrEnumerateDomainsInSamServer", "SamrLookupNamesInDomain",
+                    "SamrOpenUser", "SamrQueryInformationUser",
+                    "SamrGetGroupsForUser", "SamrGetAliasMembership",
+                    "SamrConnect", "SamrConnect5",
+                ):
+                    suspicious_events.append({
+                        "src": src, "dst": dst,
+                        "endpoint": endpoint, "operation": operation,
+                        "category": "USER/GROUP ENUMERATION",
+                        "ts": rec.get("ts", ""),
+                    })
 
         return json.dumps({
             "total_events": len(events),
-            "top_operations": op_counter.most_common(10),
+            "top_operations": op_counter.most_common(15),
+            "suspicious_events": suspicious_events[:top_n],
+            "suspicious_count": len(suspicious_events),
             "events": events[:top_n],
             "source": "zeek.dce_rpc",
         }, indent=2)
@@ -435,6 +489,25 @@ def lateral_movement_agent_node(state: dict[str, Any]) -> dict[str, Any]:
 
     zeek_ctx_dict = state.get("zeek_context", {})
     _ZEEK_FILES   = zeek_ctx_dict.get("zeek_files", {})
+
+    # ── Validate zeek files are actually reachable ────────────────────────
+    if not _ZEEK_FILES:
+        print("  [LateralMovement] WARNING: zeek_files is empty — "
+              "all tools will fall back to tshark")
+    else:
+        expected = [
+            "zeek.smb_files.ndjson", "zeek.smb_mapping.ndjson",
+            "zeek.rdp.ndjson", "zeek.kerberos.ndjson",
+            "zeek.dce_rpc.ndjson",
+        ]
+        for name in expected:
+            path = _ZEEK_FILES.get(name)
+            if not path:
+                print(f"  [LateralMovement] WARNING: {name} not in zeek_files — "
+                      f"will fall back to tshark")
+            elif not Path(path).exists():
+                print(f"  [LateralMovement] WARNING: {name} path does not exist "
+                      f"on disk: {path}")
 
     ia           = state.get("initial_access_findings", {})
     patient_zero = ia.get("patient_zero") or _ATTACK_CTX.get("patient_zero", "unknown")

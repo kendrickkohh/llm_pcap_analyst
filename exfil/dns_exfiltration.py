@@ -82,6 +82,7 @@ class DnsEvidence:
 # ---------------------------------------------------------------------------
 
 def _read_json_lines(path: Path) -> Iterable[dict]:
+    from shared.ecs_compat import normalize_record
     if not path.exists():
         return
     try:
@@ -91,7 +92,7 @@ def _read_json_lines(path: Path) -> Iterable[dict]:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield normalize_record(json.loads(line))
                 except json.JSONDecodeError:
                     continue
     except OSError:

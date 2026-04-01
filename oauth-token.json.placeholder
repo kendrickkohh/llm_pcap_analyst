@@ -1,0 +1,10 @@
+{
+  "_comment": "Generate this file by running: python auth_drive.py",
+  "_error": "ERROR: oauth-token.json not found. Run 'python auth_drive.py' to authenticate with Google Drive and generate this file. The pipeline requires authenticated Drive API access to bypass download quota limits.",
+  "token": "YOUR_TOKEN_HERE",
+  "refresh_token": "YOUR_REFRESH_TOKEN_HERE",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
+  "client_secret": "YOUR_CLIENT_SECRET",
+  "scopes": ["https://www.googleapis.com/auth/drive"]
+}

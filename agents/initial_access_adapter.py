@@ -227,8 +227,14 @@ def initial_access_agent_node(state: PipelineState) -> dict[str, Any]:
     }
 
     print(f"\n{'─' * 60}")
+    # Pass Zeek files for fast seed queries
+    zeek_ctx = get_zeek_context(state)
+    zeek_files = zeek_ctx.zeek_files if zeek_ctx else {}
+
     print("  [InitialAccess] Starting ForensicAgent…")
     print(f"  PCAP : {pcap_path}")
+    if zeek_files:
+        print(f"  Zeek : {len(zeek_files)} files (fast seed queries)")
     print(f"{'─' * 60}")
 
     t0 = time.time()
@@ -237,6 +243,7 @@ def initial_access_agent_node(state: PipelineState) -> dict[str, Any]:
         azure_config=azure_config,
         tshark_path=tshark,
         output_path=report_path,
+        zeek_files=zeek_files,
     )
     report = agent.run()
     elapsed = time.time() - t0

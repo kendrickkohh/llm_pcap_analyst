@@ -54,6 +54,7 @@ class HttpExfilEvidence:
 
 
 def _read_json_lines(path: Path) -> Iterable[dict]:
+    from shared.ecs_compat import normalize_record
     if not path.exists():
         return
     try:
@@ -63,7 +64,7 @@ def _read_json_lines(path: Path) -> Iterable[dict]:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield normalize_record(json.loads(line))
                 except json.JSONDecodeError:
                     continue
     except OSError:
@@ -86,7 +87,7 @@ def _is_private_ip(ip: str) -> bool:
 def _iter_chunk_dirs(zeek_root: Path) -> List[Path]:
     if not zeek_root.is_dir():
         return []
-    if (zeek_root / "http.log").exists() or (zeek_root / "files.log").exists():
+    if (zeek_root / "http.log").exists():
         return [zeek_root]
     return sorted((p for p in zeek_root.iterdir() if p.is_dir()), key=lambda p: p.name)
 
@@ -120,18 +121,6 @@ def _is_allowlisted(host: Optional[str], allowlist: Tuple[str, ...]) -> bool:
 def _scan_http_chunk(chunk_dir: Path) -> Dict[str, Any]:
     files_by_fuid: Dict[str, Dict[str, str]] = {}
     http_rows: List[Dict[str, Any]] = []
-
-    files_log = chunk_dir / "files.log"
-    if files_log.exists():
-        for row in _read_json_lines(files_log):
-            fuid = str(row.get("fuid") or "")
-            if not fuid:
-                continue
-            files_by_fuid[fuid] = {
-                "mime_type": str(row.get("mime_type") or ""),
-                "filename": str(row.get("filename") or ""),
-                "seen_bytes": str(row.get("seen_bytes") or ""),
-            }
 
     http_log = chunk_dir / "http.log"
     if http_log.exists():

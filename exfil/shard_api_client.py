@@ -2,24 +2,29 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin, urlparse, parse_qsl
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-
-DEFAULT_API_BASE_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbxpkayBZGiYl-dbQ1P8SpLmjn4P8F9ZhPg3djTMSIv9Aj3C106uiOsRTC9zWQ2w0nl6/exec"
-)
+# Use centralised API config; fall back to hardcoded URL if import fails
+# (e.g. when this module is used standalone outside the pipeline)
+try:
+    from shared.api_config import get_api_base as _get_api_base
+    DEFAULT_API_BASE_URL = _get_api_base()
+except ImportError:
+    DEFAULT_API_BASE_URL = (
+        "https://script.google.com/macros/s/"
+        "AKfycbxmTGLe87Im3GX8E-KInQmp4HIMX4zraA_0iJ7HBClBkKB7PvEJ_qFVzuGett9OWNGF/exec"
+    )
 
 _DEFAULT_ZEEK_DATASETS = [
     "zeek.connection.ndjson",
     "zeek.dns.ndjson",
     "zeek.ssl.ndjson",
     "zeek.http.ndjson",
-    "zeek.files.ndjson",
 ]
 _DATASET_ALIASES = {
     "conn": "zeek.connection.ndjson",
@@ -27,14 +32,12 @@ _DATASET_ALIASES = {
     "dns": "zeek.dns.ndjson",
     "ssl": "zeek.ssl.ndjson",
     "http": "zeek.http.ndjson",
-    "files": "zeek.files.ndjson",
 }
 _LOCAL_DATASET_FILENAMES = {
     "zeek.connection.ndjson": "conn.log",
     "zeek.dns.ndjson": "dns.log",
     "zeek.ssl.ndjson": "ssl.log",
     "zeek.http.ndjson": "http.log",
-    "zeek.files.ndjson": "files.log",
 }
 
 

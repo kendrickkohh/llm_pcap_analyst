@@ -501,10 +501,12 @@ class ForensicAgent:
         azure_config: dict,
         tshark_path: str,
         output_path: str,
+        zeek_files: dict[str, str] | None = None,
     ):
         self.pcap_path = pcap_path
         self.output_path = output_path
         self.tools = PcapTools(pcap_path, tshark_path)
+        self.zeek_files = zeek_files or {}
 
         self.client = AzureOpenAI(
             azure_endpoint=azure_config["endpoint"],
@@ -521,18 +523,150 @@ class ForensicAgent:
         # Run seed queries to build the initial context
         self._run_seed_queries()
 
+    # ── Zeek-based seed queries (fast alternative to tshark) ────────────
+
+    def _zeek_seed_rdp_brute_force(self) -> str | None:
+        """Count RDP sources from Zeek RDP log — replaces tshark SYN counting."""
+        rdp_path = self.zeek_files.get("zeek.rdp.ndjson")
+        if not rdp_path or not os.path.isfile(rdp_path):
+            return None
+        from shared.ecs_compat import normalize_record
+        from collections import Counter
+        src_counts: Counter = Counter()
+        total = 0
+        for line in open(rdp_path, "r", encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = normalize_record(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            src = rec.get("id.orig_h", "")
+            if src:
+                src_counts[src] += 1
+                total += 1
+        lines = [f"Total RDP connection attempts: {total}",
+                 f"Unique source IPs: {len(src_counts)}", "",
+                 f"{'Source IP':<25} {'Count':>8}",
+                 f"{'─'*25} {'─'*8}"]
+        for ip, count in src_counts.most_common(25):
+            lines.append(f"{ip:<25} {count:>8}")
+        return "\n".join(lines)
+
+    def _zeek_seed_tcp_conversations_3389(self) -> str | None:
+        """Top TCP conversations on port 3389 from Zeek conn log."""
+        conn_path = self.zeek_files.get("zeek.connection.ndjson")
+        if not conn_path or not os.path.isfile(conn_path):
+            return None
+        from shared.ecs_compat import normalize_record
+        sessions: list[dict] = []
+        for line in open(conn_path, "r", encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = normalize_record(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            resp_port = rec.get("id.resp_p", 0)
+            orig_port = rec.get("id.orig_p", 0)
+            if resp_port != 3389 and orig_port != 3389:
+                continue
+            orig_bytes = rec.get("orig_bytes", 0) or 0
+            resp_bytes = rec.get("resp_bytes", 0) or 0
+            total = int(orig_bytes) + int(resp_bytes)
+            sessions.append({
+                "src": rec.get("id.orig_h", ""),
+                "dst": rec.get("id.resp_h", ""),
+                "src_port": orig_port,
+                "dst_port": resp_port,
+                "orig_bytes": orig_bytes,
+                "resp_bytes": resp_bytes,
+                "total_bytes": total,
+                "duration": rec.get("duration", 0) or 0,
+                "ts": rec.get("ts", ""),
+            })
+        sessions.sort(key=lambda s: s["total_bytes"], reverse=True)
+        lines = [f"TCP Conversations on port 3389 ({len(sessions)} total, sorted by bytes):", "",
+                 f"{'Source':<22} {'Destination':<22} {'Orig Bytes':>12} {'Resp Bytes':>12} {'Total':>12} {'Duration':>10}",
+                 f"{'─'*22} {'─'*22} {'─'*12} {'─'*12} {'─'*12} {'─'*10}"]
+        for s in sessions[:50]:
+            lines.append(f"{s['src']:<22} {s['dst']:<22} {s['orig_bytes']:>12} {s['resp_bytes']:>12} {s['total_bytes']:>12} {s['duration']:>10.1f}")
+        if len(sessions) > 50:
+            lines.append(f"\n... [{len(sessions) - 50} more conversations not shown]")
+        return "\n".join(lines)
+
+    def _zeek_seed_dns_rmm(self) -> str | None:
+        """Search DNS for RMM/C2 domains from Zeek DNS log."""
+        dns_path = self.zeek_files.get("zeek.dns.ndjson")
+        if not dns_path or not os.path.isfile(dns_path):
+            return None
+        from shared.ecs_compat import normalize_record
+        keywords = ["rmm", "tactical", "mesh"]
+        matches: list[str] = []
+        for line in open(dns_path, "r", encoding="utf-8", errors="replace"):
+            if len(matches) >= 50:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = normalize_record(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            query = rec.get("query", "")
+            if any(kw in query.lower() for kw in keywords):
+                ts = rec.get("ts", "")
+                src = rec.get("id.orig_h", "")
+                matches.append(f"{ts}  {src:<18} {query}")
+        if not matches:
+            return "No DNS queries matching RMM/C2 patterns (rmm, tactical, mesh) found."
+        return "\n".join(matches)
+
     # ── seed queries ───────────────────────────────────────────────────────
 
     def _run_seed_queries(self):
-        """Run mandatory pre-analysis queries and inject results as context."""
+        """Run mandatory pre-analysis queries and inject results as context.
+
+        Prefers Zeek-based queries (fast, full-day coverage) when Zeek files
+        are available, falling back to tshark on the PCAP.
+        """
         print(f"\n{'─' * 64}")
         print("  Running seed queries (mandatory pre-analysis)...")
         print(f"{'─' * 64}")
 
         seed_results = []
-        for i, sq in enumerate(SEED_QUERIES, 1):
+        use_zeek = bool(self.zeek_files)
+
+        # Build seed query list — Zeek overrides for the slow tshark queries
+        queries = list(SEED_QUERIES)  # copy
+        zeek_overrides = {}
+        if use_zeek:
+            zeek_overrides = {
+                1: ("RDP Brute-Force Sources (from Zeek RDP log)", self._zeek_seed_rdp_brute_force),
+                2: ("All TCP Conversations on Port 3389 (from Zeek conn log)", self._zeek_seed_tcp_conversations_3389),
+                3: ("DNS queries for RMM/C2 domains (from Zeek DNS log)", self._zeek_seed_dns_rmm),
+            }
+
+        for i, sq in enumerate(queries, 1):
+            override = zeek_overrides.get(i - 1)  # 0-indexed
+            if override:
+                label, fn = override
+                print(f"  [{i}/{len(queries)}] {label}...", end=" ", flush=True)
+                t0 = time.time()
+                result = fn()
+                elapsed = time.time() - t0
+                if result is not None:
+                    print(f"({elapsed:.1f}s) [zeek]")
+                    seed_results.append(f"### {label}\n```\n{result}\n```")
+                    continue
+                # Zeek unavailable for this query, fall through to tshark
+                print(f"(zeek unavailable, using tshark)", end=" ", flush=True)
+
             label = sq["label"]
-            print(f"  [{i}/{len(SEED_QUERIES)}] {label}...", end=" ", flush=True)
+            if not override:
+                print(f"  [{i}/{len(queries)}] {label}...", end=" ", flush=True)
             t0 = time.time()
             result = self._execute_tool(sq["tool"], sq["args"])
             elapsed = time.time() - t0
