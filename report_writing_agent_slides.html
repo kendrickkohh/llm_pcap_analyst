@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Report Writing Agent — SC4063 Pipeline</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0d1117; color: #e6edf3; overflow: hidden; }
+
+.deck { position: relative; width: 100vw; height: 100vh; }
+.slide { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; padding: 60px 80px; opacity: 0; pointer-events: none; transition: opacity 0.45s ease; }
+.slide.active { opacity: 1; pointer-events: auto; }
+
+h1 { font-size: 2.8em; font-weight: 700; margin-bottom: 0.3em; color: #58a6ff; }
+h2 { font-size: 1.9em; font-weight: 600; margin-bottom: 0.5em; color: #79c0ff; }
+h3 { font-size: 1.3em; font-weight: 600; margin-bottom: 0.4em; color: #58a6ff; }
+p, li { font-size: 1.15em; line-height: 1.65; color: #c9d1d9; }
+ul, ol { margin-left: 1.5em; margin-bottom: 0.7em; }
+li { margin-bottom: 0.35em; }
+strong { color: #f0f6fc; }
+code { background: #161b22; padding: 2px 7px; border-radius: 4px; font-size: 0.92em; color: #79c0ff; font-family: 'Cascadia Code', 'Fira Code', monospace; }
+.highlight { color: #ffa657; font-weight: 600; }
+.accent { color: #7ee787; }
+.warn { color: #f85149; }
+
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 20px; }
+.three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 30px; margin-top: 20px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px; }
+.card h3 { margin-bottom: 12px; }
+
+table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 0.95em; }
+th { background: #161b22; color: #58a6ff; text-align: left; padding: 10px 14px; border-bottom: 2px solid #30363d; }
+td { padding: 8px 14px; border-bottom: 1px solid #21262d; color: #c9d1d9; }
+tr:hover td { background: #161b2288; }
+
+.flow-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 18px 0; }
+.flow-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 20px; font-weight: 600; font-size: 1em; text-align: center; min-width: 130px; }
+.flow-box.active-box { border-color: #58a6ff; background: #0d1117; color: #58a6ff; }
+.flow-arrow { font-size: 1.5em; color: #484f58; }
+
+.diagram { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 20px 0; }
+.diagram-row { display: flex; align-items: center; gap: 10px; }
+.d-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 18px; text-align: center; font-size: 0.95em; min-width: 110px; }
+.d-box.blue { border-color: #58a6ff; color: #58a6ff; }
+.d-box.green { border-color: #7ee787; color: #7ee787; }
+.d-box.orange { border-color: #ffa657; color: #ffa657; }
+.d-box.red { border-color: #f85149; color: #f85149; }
+.d-arrow { font-size: 1.3em; color: #484f58; }
+
+.nav { position: fixed; bottom: 20px; right: 30px; display: flex; gap: 12px; z-index: 100; }
+.nav button { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 0.95em; }
+.nav button:hover { background: #30363d; }
+.progress { position: fixed; bottom: 0; left: 0; height: 3px; background: #58a6ff; transition: width 0.3s ease; z-index: 100; }
+.slide-num { position: fixed; bottom: 24px; left: 30px; color: #484f58; font-size: 0.85em; z-index: 100; }
+
+.title-slide { text-align: center; }
+.title-slide h1 { font-size: 3.2em; margin-bottom: 0.2em; }
+.title-slide .subtitle { font-size: 1.5em; color: #8b949e; margin-bottom: 1em; }
+.title-slide .meta { font-size: 1.05em; color: #484f58; }
+
+.scroll-content { overflow-y: auto; max-height: calc(100vh - 180px); padding-right: 10px; }
+.scroll-content::-webkit-scrollbar { width: 6px; }
+.scroll-content::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+.badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 600; margin-right: 6px; }
+.badge.blue { background: #0d419d; color: #79c0ff; }
+.badge.green { background: #0f5132; color: #7ee787; }
+.badge.orange { background: #5a3600; color: #ffa657; }
+.badge.red { background: #67060c; color: #f85149; }
+
+.code-block { background: #0d1117; border: 1px solid #30363d; border-radius: 10px; padding: 20px 24px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 0.85em; line-height: 1.7; overflow-y: auto; max-height: 50vh; }
+
+.section-slide { text-align: center; }
+.section-slide h1 { font-size: 3em; }
+.section-slide p { font-size: 1.3em; color: #8b949e; margin-top: 0.5em; }
+.section-num { font-size: 5em; font-weight: 800; color: #21262d; margin-bottom: -0.2em; }
+
+.rule-box { border-left: 3px solid #58a6ff; padding: 12px 16px; margin-bottom: 12px; background: #161b22; border-radius: 0 8px 8px 0; }
+.rule-box.warn-box { border-left-color: #f85149; }
+.rule-box.green-box { border-left-color: #7ee787; }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ============================================================ -->
+<!-- SLIDE 1: TITLE -->
+<!-- ============================================================ -->
+<div class="slide title-slide active" id="s1">
+  <h1>Report Writing Agent</h1>
+  <div class="subtitle">Autonomous Forensic Report Synthesis</div>
+  <div class="meta">
+    SC4063 Agentic Network Forensic Analysis Pipeline<br>
+    LLM-driven synthesis &nbsp;·&nbsp; 8 mandatory sections &nbsp;·&nbsp; Anti-hallucination &nbsp;·&nbsp; Markdown + PDF output
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 2: WHERE IT FITS -->
+<!-- ============================================================ -->
+<div class="slide" id="s2">
+  <h2>Architecture: Where the Report Writer Fits</h2>
+  <div class="diagram">
+    <div class="diagram-row">
+      <div class="d-box">① Initial Access</div>
+      <div class="d-arrow">→</div>
+      <div class="d-box">② Lateral Movement</div>
+      <div class="d-arrow">→</div>
+      <div class="d-box">③ Exfiltration</div>
+      <div class="d-arrow">→</div>
+      <div class="d-box">④ Payload</div>
+    </div>
+    <div class="d-arrow" style="font-size: 1.6em;">↓</div>
+    <div class="diagram-row">
+      <div class="d-box orange">MITRE ATT&amp;CK Enrichment<br><small>835 techniques · keyword matching</small></div>
+    </div>
+    <div class="d-arrow" style="font-size: 1.6em;">↓</div>
+    <div class="diagram-row">
+      <div class="d-box green" style="min-width: 350px; padding: 16px 28px; font-size: 1.1em;">
+        📝 <strong>Report Writing Agent</strong><br>
+        <small>GPT-4o-mini · temp 0.1 · 16K tokens</small>
+      </div>
+    </div>
+    <div class="d-arrow" style="font-size: 1.6em;">↓</div>
+    <div class="diagram-row">
+      <div class="d-box" style="border-color: #7ee787; color: #7ee787;">📄 Markdown + 📑 PDF</div>
+    </div>
+  </div>
+  <p style="text-align: center; color: #8b949e; margin-top: 16px;">
+    Deterministic routing: agents → MITRE → <strong>report writer</strong> — no LLM-based orchestration decisions
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 3: INPUTS -->
+<!-- ============================================================ -->
+<div class="slide" id="s3">
+  <h2>Inputs: 7 Fields from PipelineState</h2>
+  <div class="scroll-content">
+    <table>
+      <tr><th>Input Field</th><th>Type</th><th>Contents</th></tr>
+      <tr>
+        <td><code>target_day</code></td>
+        <td>str</td>
+        <td>"YYYY-MM-DD" — the day being reported</td>
+      </tr>
+      <tr>
+        <td><code>initial_access_findings</code></td>
+        <td>InitialAccessFindings</td>
+        <td>Patient zero, attacker IP, attack vector, brute-force count, session bytes, IOCs</td>
+      </tr>
+      <tr>
+        <td><code>lateral_movement_findings</code></td>
+        <td>LateralMovementFindings</td>
+        <td>Compromised hosts, movement paths (src→dst), techniques, evidence highlights</td>
+      </tr>
+      <tr>
+        <td><code>exfiltration_findings</code></td>
+        <td>ExfiltrationFindings</td>
+        <td>Detected flag, data volume, destination IPs/domains, protocols, timeframe</td>
+      </tr>
+      <tr>
+        <td><code>payload_findings</code></td>
+        <td>PayloadFindings</td>
+        <td>Deployment method, suspicious/malicious files, SHA256 hashes, analysis results</td>
+      </tr>
+      <tr>
+        <td><code>attack_context</code></td>
+        <td>dict</td>
+        <td>Accumulated cross-day: patient_zero, compromised_hosts, attacker_ips, timeline_events</td>
+      </tr>
+      <tr>
+        <td><code>mitre_enrichment</code></td>
+        <td>dict</td>
+        <td>Matched techniques (IDs + names + tactics), candidate threat groups (overlap scores)</td>
+      </tr>
+    </table>
+    <p style="margin-top: 16px; color: #8b949e;">
+      All findings are serialised as <strong>JSON</strong> and passed in a single structured prompt.<br>
+      <code>merge_all_iocs(state)</code> consolidates IOCs from all agents before inclusion.
+    </p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 4: TWO MODES -->
+<!-- ============================================================ -->
+<div class="slide" id="s4">
+  <h2>Two Modes: Single-Day vs. Multi-Day</h2>
+  <div class="two-col">
+    <div class="card">
+      <h3><span class="accent">Single-Day Mode</span></h3>
+      <p style="margin-bottom: 12px;"><code>report_writing_node()</code></p>
+      <ul>
+        <li>Takes <strong>one day's</strong> findings from PipelineState</li>
+        <li>Serialises all agent findings as JSON</li>
+        <li>Single LLM call with system prompt</li>
+        <li>Output: <code>incident_report_YYYY-MM-DD.md/.pdf</code></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="highlight">Multi-Day Mode</span></h3>
+      <p style="margin-bottom: 12px;"><code>write_combined_report()</code></p>
+      <ul>
+        <li>Receives <strong>all per-day results</strong> as a list</li>
+        <li><strong>Deduplicates</strong> before LLM call:
+          <ul>
+            <li>IOCs by <code>(type, value)</code> tuple</li>
+            <li>MITRE techniques by <code>attack_id</code></li>
+            <li>Threat groups by <code>group_id</code> (top 10)</li>
+          </ul>
+        </li>
+        <li>Per-day sections with <code>────</code> separators</li>
+        <li>Output: <code>combined_incident_report.md/.pdf</code></li>
+      </ul>
+    </div>
+  </div>
+  <div style="margin-top: 20px; text-align: center;">
+    <p style="color: #8b949e;">Both modes use the <strong>same system prompt</strong>, same model (<code>gpt-4o-mini</code>), and same <code>temperature=0.1</code></p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 5: REPORT STRUCTURE -->
+<!-- ============================================================ -->
+<div class="slide" id="s5">
+  <h2>8 Mandatory Report Sections</h2>
+  <div class="two-col">
+    <div>
+      <div class="rule-box" style="border-left-color: #58a6ff;">
+        <strong>1. Title / Cover Page</strong><br>
+        <span style="color: #8b949e;">Incident header, date range, case ID</span>
+      </div>
+      <div class="rule-box" style="border-left-color: #58a6ff;">
+        <strong>2. Table of Contents</strong><br>
+        <span style="color: #8b949e;">LLM-generated to match actual sections</span>
+      </div>
+      <div class="rule-box green-box">
+        <strong>3. Executive Summary</strong><br>
+        <span style="color: #8b949e;">C-suite audience: root cause, business impact, recommendations</span>
+      </div>
+      <div class="rule-box green-box">
+        <strong>4. Detailed Findings</strong><br>
+        <span style="color: #8b949e;">Per attack phase with MITRE ATT&amp;CK mapping:<br>
+        Initial Access · Lateral Movement · Exfiltration · Payload</span>
+      </div>
+    </div>
+    <div>
+      <div class="rule-box green-box">
+        <strong>5. Conclusion &amp; Recommendations</strong><br>
+        <span style="color: #8b949e;">Prioritised: High / Medium / Low</span>
+      </div>
+      <div class="rule-box" style="border-left-color: #ffa657;">
+        <strong>6. Appendix — Timeline</strong><br>
+        <span style="color: #8b949e;">Chronological reconstruction across all days</span>
+      </div>
+      <div class="rule-box" style="border-left-color: #ffa657;">
+        <strong>7. Appendix — Technical Details</strong><br>
+        <span style="color: #8b949e;">Packet traces, IOC details, 5-tuples</span>
+      </div>
+      <div class="rule-box warn-box">
+        <strong>8. Evidence Gaps</strong><br>
+        <span style="color: #8b949e;">What the pipeline could NOT determine — scope limits, missing data</span>
+      </div>
+    </div>
+  </div>
+  <p style="margin-top: 12px; color: #8b949e; text-align: center;">
+    <strong>+</strong> Optional 9th section: <strong>Evidence Provenance Appendix</strong> (auto-appended if <code>--track-provenance</code> enabled)
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 6: ANTI-HALLUCINATION -->
+<!-- ============================================================ -->
+<div class="slide" id="s6">
+  <h2>Anti-Hallucination: 4 Rules + Low Temperature</h2>
+  <div class="scroll-content">
+    <div class="card" style="margin-bottom: 16px;">
+      <h3 style="color: #f85149;">Rule 1: Evidence References Required</h3>
+      <div class="code-block" style="margin-top: 8px; font-size: 0.95em;">
+        "Every significant claim must include supporting evidence references."
+      </div>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3 style="color: #f85149;">Rule 2: Concrete References Preferred</h3>
+      <div class="code-block" style="margin-top: 8px; font-size: 0.95em;">
+        "Prefer concrete references: 5-tuples, host/user identifiers, timestamps, log sources."
+      </div>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3 style="color: #ffa657;">Rule 3: Insufficient Evidence Fallback</h3>
+      <div class="code-block" style="margin-top: 8px; font-size: 0.95em;">
+        "If evidence is missing, write 'Insufficient evidence' rather than guessing."
+      </div>
+      <p style="margin-top: 8px; color: #8b949e;">Explicit escape hatch — the LLM doesn't need to fabricate to fill gaps.</p>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3 style="color: #f85149;">Rule 4: Fabrication Blacklist</h3>
+      <div class="code-block" style="margin-top: 8px; font-size: 0.95em;">
+        "Never fabricate packet IDs, hashes, users, hosts, ATT&amp;CK IDs, or timestamps."
+      </div>
+    </div>
+    <div class="card" style="border-color: #7ee787;">
+      <h3 style="color: #7ee787;">+ Temperature: 0.1</h3>
+      <p>Near-deterministic output. Maximises factual consistency over prose fluency.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 7: PDF GENERATION -->
+<!-- ============================================================ -->
+<div class="slide" id="s7">
+  <h2>PDF Generation: Markdown → ReportLab</h2>
+  <div class="two-col">
+    <div>
+      <h3>Page Setup</h3>
+      <table>
+        <tr><th>Property</th><th>Value</th></tr>
+        <tr><td>Page size</td><td>A4 (210 × 297 mm)</td></tr>
+        <tr><td>Margins</td><td>2 cm all sides</td></tr>
+        <tr><td>H1</td><td>18pt + horizontal rule</td></tr>
+        <tr><td>H2</td><td>14pt</td></tr>
+        <tr><td>H3</td><td>12pt</td></tr>
+        <tr><td>Body</td><td>10pt, 14pt leading</td></tr>
+        <tr><td>Code/Tables</td><td>8pt Courier, indented</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>Markdown Features Supported</h3>
+      <ul>
+        <li><code># ## ###</code> → Heading styles</li>
+        <li><code>**bold**</code> → <strong>&lt;b&gt;</strong></li>
+        <li><code>*italic*</code> → <em>&lt;i&gt;</em></li>
+        <li><code>`code`</code> → Courier font</li>
+        <li><code>- * +</code> → Bullet lists</li>
+        <li><code>```blocks```</code> → Code blocks</li>
+        <li><code>| tables |</code> → Monospace render</li>
+        <li><code>---</code> → Horizontal rules</li>
+      </ul>
+      <h3 style="margin-top: 16px;">Security</h3>
+      <p>XML escaping: <code>&amp;</code>, <code>&lt;</code>, <code>&gt;</code> all escaped to prevent ReportLab injection</p>
+    </div>
+  </div>
+  <div style="margin-top: 16px;">
+    <div class="rule-box warn-box">
+      <strong>Critical table rule:</strong> Table cells must be single-line — no line breaks inside cells.
+      Multiple items use semicolons: <code>item1; item2; item3</code>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 8: PROVENANCE -->
+<!-- ============================================================ -->
+<div class="slide" id="s8">
+  <h2>Provenance Tracking: Full Audit Trail</h2>
+  <div class="two-col">
+    <div>
+      <h3>What's Recorded</h3>
+      <table>
+        <tr><th>Category</th><th>Details</th></tr>
+        <tr><td><strong>PCAPs analysed</strong></td><td>File name, path, size per day</td></tr>
+        <tr><td><strong>Zeek log files</strong></td><td>Dataset filenames per day</td></tr>
+        <tr><td><strong>Agent sources</strong></td><td>Which agent accessed which files</td></tr>
+        <tr><td><strong>Days analysed</strong></td><td>Chronological day list</td></tr>
+      </table>
+      <h3 style="margin-top: 20px;">Activation</h3>
+      <p><code>--track-provenance</code> CLI flag<br>
+      <span style="color: #8b949e;">Module-level singleton via <code>ProvenanceLog</code></span></p>
+    </div>
+    <div>
+      <h3>Generated Appendix (example)</h3>
+      <div class="code-block" style="font-size: 0.78em;">
+        <span style="color: #79c0ff;">## Appendix: Evidence Provenance</span><br><br>
+        <span style="color: #7ee787;">### PCAPs Analysed</span><br>
+        | Day | PCAP File | Size |<br>
+        |-----|-----------|------|<br>
+        | 2025-03-06 | <span style="color: #ffa657;">`capture.pcap`</span> | 1.2 GB |<br><br>
+        <span style="color: #7ee787;">### Per-Agent Source Files</span><br>
+        | Day | Agent | Files Accessed |<br>
+        |-----|-------|----------------|<br>
+        | 2025-03-06 | initial_access | <span style="color: #ffa657;">`capture.pcap`</span> |<br>
+        | 2025-03-06 | lateral_movement | <span style="color: #ffa657;">`zeek.smb.ndjson`</span> |<br>
+        | 2025-03-06 | exfiltration | <span style="color: #ffa657;">`zeek.dns.ndjson`</span> |
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 9: CHALLENGES -->
+<!-- ============================================================ -->
+<div class="slide" id="s9">
+  <h2>Key Challenges</h2>
+  <div class="two-col">
+    <div class="card" style="margin-bottom: 16px;">
+      <h3><span class="warn">Context Window Pressure</span></h3>
+      <p>9-day combined report: all agent findings, IOCs, MITRE data across 9 days must fit in context. 16K output token budget constrains report length.</p>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3><span class="warn">Table Formatting Compliance</span></h3>
+      <p>LLMs naturally produce multi-line table cells. ReportLab cannot handle this. System prompt includes explicit WRONG/RIGHT examples — but enforcement is best-effort.</p>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3><span class="warn">Cross-Day Attribution</span></h3>
+      <p>With 9 days of similar data, the LLM may attribute an IP or timestamp to the wrong day. Per-day sections with visual separators mitigate but don't eliminate this.</p>
+    </div>
+    <div class="card" style="margin-bottom: 16px;">
+      <h3><span class="warn">No Post-Generation Validation</span></h3>
+      <p>Unlike the exfiltration agent's grounding check, the report writer has <strong>no automated fact-checking</strong>. Mitigation: low temperature + strict prompting.</p>
+      <p style="color: #8b949e; margin-top: 8px;">Known limitation — a future improvement area.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 10: COST & EFFICIENCY -->
+<!-- ============================================================ -->
+<div class="slide" id="s10">
+  <h2>Cost &amp; Efficiency</h2>
+  <div class="two-col">
+    <div>
+      <h3>Configuration</h3>
+      <table>
+        <tr><th>Parameter</th><th>Value</th></tr>
+        <tr><td>Model</td><td><strong>GPT-4o-mini</strong> (Azure)</td></tr>
+        <tr><td>Temperature</td><td>0.1</td></tr>
+        <tr><td>Max tokens</td><td>16,000</td></tr>
+        <tr><td>API version</td><td>2024-02-01</td></tr>
+        <tr><td>LLM calls per report</td><td><strong>1</strong></td></tr>
+      </table>
+      <h3 style="margin-top: 20px;">Estimated Cost</h3>
+      <table>
+        <tr><th>Report Type</th><th>Cost</th></tr>
+        <tr><td>Single-day report</td><td>~$0.05–$0.10</td></tr>
+        <tr><td>Combined 9-day report</td><td>~$0.10–$0.20</td></tr>
+      </table>
+      <p style="color: #8b949e; margin-top: 8px; font-size: 0.9em;">At $0.15/M input · $0.60/M output tokens</p>
+    </div>
+    <div>
+      <h3>Time Breakdown</h3>
+      <table>
+        <tr><th>Step</th><th>Duration</th></tr>
+        <tr><td>JSON serialisation</td><td>&lt;1 second</td></tr>
+        <tr><td>LLM inference</td><td>~90–120 seconds</td></tr>
+        <tr><td>PDF rendering</td><td>&lt;1 second</td></tr>
+        <tr><td><strong>Total</strong></td><td><strong class="accent">~2 minutes</strong></td></tr>
+      </table>
+      <div class="card" style="margin-top: 20px;">
+        <h3>Why GPT-4o-mini?</h3>
+        <p>The report writer <strong>synthesises pre-structured findings</strong> — it doesn't reason about raw network data. This makes it ideal for the smaller, cheaper model.</p>
+        <p style="margin-top: 8px; color: #8b949e;">Just 1 LLM call vs. 30+ tool calls in the Initial Access agent</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 11: SUMMARY -->
+<!-- ============================================================ -->
+<div class="slide" id="s11">
+  <h2>Summary: Report Writing Agent</h2>
+  <div style="margin-top: 20px;">
+    <ul style="font-size: 1.2em; line-height: 2;">
+      <li><span class="accent">✓</span> <strong>Single-call LLM agent</strong> — synthesises all forensic findings into structured report</li>
+      <li><span class="accent">✓</span> <strong>Two modes:</strong> single-day (<code>report_writing_node</code>) and multi-day with deduplication (<code>write_combined_report</code>)</li>
+      <li><span class="accent">✓</span> <strong>8 mandatory sections</strong> — Executive Summary through Evidence Gaps</li>
+      <li><span class="accent">✓</span> <strong>4 anti-hallucination rules</strong> + temperature 0.1 — evidence-only, no fabrication</li>
+      <li><span class="accent">✓</span> <strong>Markdown + PDF output</strong> — custom ReportLab renderer with XML escaping</li>
+      <li><span class="accent">✓</span> <strong>Provenance tracking</strong> — full audit trail of evidence sources per agent per day</li>
+      <li><span class="accent">✓</span> <strong>~$0.10–$0.20 per report</strong> — generated in ~2 minutes with GPT-4o-mini</li>
+    </ul>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- ── Navigation ─────────────────────────────────────────────── -->
+<div class="slide-num" id="slideNum">1 / 11</div>
+<div class="progress" id="progress" style="width: 9.09%;"></div>
+<div class="nav">
+  <button onclick="prev()" id="btnPrev">← Prev</button>
+  <button onclick="next()" id="btnNext">Next →</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let current = 0;
+
+function show(n) {
+  if (n < 0 || n >= slides.length) return;
+  slides[current].classList.remove('active');
+  current = n;
+  slides[current].classList.add('active');
+  document.getElementById('slideNum').textContent = `${current + 1} / ${slides.length}`;
+  document.getElementById('progress').style.width = `${((current + 1) / slides.length) * 100}%`;
+}
+
+function next() { show(current + 1); }
+function prev() { show(current - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); show(0); }
+  if (e.key === 'End') { e.preventDefault(); show(slides.length - 1); }
+});
+
+let touchStartX = 0;
+document.addEventListener('touchstart', e => { touchStartX = e.changedTouches[0].screenX; });
+document.addEventListener('touchend', e => {
+  const diff = e.changedTouches[0].screenX - touchStartX;
+  if (Math.abs(diff) > 50) { diff < 0 ? next() : prev(); }
+});
+</script>
+</body>
+</html>
