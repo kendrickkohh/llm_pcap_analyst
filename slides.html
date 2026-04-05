@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SC4063 Agentic Network Forensic Analysis Pipeline</title>
+<style>
+/* ── Reset & Base ────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0d1117; color: #e6edf3; overflow: hidden; }
+
+/* ── Slide Container ─────────────────────────────────── */
+.deck { position: relative; width: 100vw; height: 100vh; }
+.slide { position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: center; padding: 60px 80px; opacity: 0; pointer-events: none; transition: opacity 0.45s ease; }
+.slide.active { opacity: 1; pointer-events: auto; }
+
+/* ── Typography ──────────────────────────────────────── */
+h1 { font-size: 2.8em; font-weight: 700; margin-bottom: 0.3em; color: #58a6ff; }
+h2 { font-size: 1.9em; font-weight: 600; margin-bottom: 0.5em; color: #79c0ff; }
+h3 { font-size: 1.3em; font-weight: 600; margin-bottom: 0.4em; color: #58a6ff; }
+p, li { font-size: 1.15em; line-height: 1.65; color: #c9d1d9; }
+ul, ol { margin-left: 1.5em; margin-bottom: 0.7em; }
+li { margin-bottom: 0.35em; }
+strong { color: #f0f6fc; }
+code { background: #161b22; padding: 2px 7px; border-radius: 4px; font-size: 0.92em; color: #79c0ff; font-family: 'Cascadia Code', 'Fira Code', monospace; }
+.highlight { color: #ffa657; font-weight: 600; }
+.accent { color: #7ee787; }
+.warn { color: #f85149; }
+
+/* ── Layout helpers ──────────────────────────────────── */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 20px; }
+.three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 30px; margin-top: 20px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 24px; }
+.card h3 { margin-bottom: 12px; }
+.flow-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 18px 0; }
+.flow-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 20px; font-weight: 600; font-size: 1em; text-align: center; min-width: 130px; }
+.flow-box.active-box { border-color: #58a6ff; background: #0d1117; color: #58a6ff; }
+.flow-arrow { font-size: 1.5em; color: #484f58; }
+
+/* ── Tables ──────────────────────────────────────────── */
+table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 0.95em; }
+th { background: #161b22; color: #58a6ff; text-align: left; padding: 10px 14px; border-bottom: 2px solid #30363d; }
+td { padding: 8px 14px; border-bottom: 1px solid #21262d; color: #c9d1d9; }
+tr:hover td { background: #161b2288; }
+
+/* ── Diagram boxes ───────────────────────────────────── */
+.diagram { display: flex; flex-direction: column; align-items: center; gap: 10px; margin: 20px 0; }
+.diagram-row { display: flex; align-items: center; gap: 10px; }
+.d-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 18px; text-align: center; font-size: 0.95em; min-width: 110px; }
+.d-box.blue { border-color: #58a6ff; color: #58a6ff; }
+.d-box.green { border-color: #7ee787; color: #7ee787; }
+.d-box.orange { border-color: #ffa657; color: #ffa657; }
+.d-box.red { border-color: #f85149; color: #f85149; }
+.d-arrow { font-size: 1.3em; color: #484f58; }
+
+/* ── Nav ─────────────────────────────────────────────── */
+.nav { position: fixed; bottom: 20px; right: 30px; display: flex; gap: 12px; z-index: 100; }
+.nav button { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 0.95em; }
+.nav button:hover { background: #30363d; }
+.progress { position: fixed; bottom: 0; left: 0; height: 3px; background: #58a6ff; transition: width 0.3s ease; z-index: 100; }
+.slide-num { position: fixed; bottom: 24px; left: 30px; color: #484f58; font-size: 0.85em; z-index: 100; }
+
+/* ── Title slide special ─────────────────────────────── */
+.title-slide { text-align: center; }
+.title-slide h1 { font-size: 3.2em; margin-bottom: 0.2em; }
+.title-slide .subtitle { font-size: 1.5em; color: #8b949e; margin-bottom: 1em; }
+.title-slide .meta { font-size: 1.05em; color: #484f58; }
+
+/* ── Scrollable content ──────────────────────────────── */
+.scroll-content { overflow-y: auto; max-height: calc(100vh - 180px); padding-right: 10px; }
+.scroll-content::-webkit-scrollbar { width: 6px; }
+.scroll-content::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+/* ── Badge ───────────────────────────────────────────── */
+.badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 600; margin-right: 6px; }
+.badge.blue { background: #0d419d; color: #79c0ff; }
+.badge.green { background: #0f5132; color: #7ee787; }
+.badge.orange { background: #5a3600; color: #ffa657; }
+.badge.red { background: #67060c; color: #f85149; }
+
+/* Section divider slide */
+.section-slide { text-align: center; }
+.section-slide h1 { font-size: 3em; }
+.section-slide p { font-size: 1.3em; color: #8b949e; margin-top: 0.5em; }
+.section-num { font-size: 5em; font-weight: 800; color: #21262d; margin-bottom: -0.2em; }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ============================================================ -->
+<!-- SLIDE 1: TITLE -->
+<!-- ============================================================ -->
+<div class="slide title-slide active" id="s1">
+  <h1>SC4063 Agentic Network Forensic<br>Analysis Pipeline</h1>
+  <div class="subtitle">Autonomous PCAP Analysis with LLM-Driven Agents</div>
+  <div class="meta">
+    SC4063 Final Project &nbsp;·&nbsp; Apex Global Logistics Lynx Ransomware Incident<br>
+    9 days of network capture &nbsp;·&nbsp; 4 specialist agents &nbsp;·&nbsp; MITRE ATT&amp;CK mapping &nbsp;·&nbsp; Automated PDF report
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 2: AGENDA -->
+<!-- ============================================================ -->
+<div class="slide" id="s2">
+  <h2>Agenda</h2>
+  <div style="margin-top: 30px;">
+    <div class="flow-row" style="flex-direction: column; align-items: flex-start; gap: 20px;">
+      <div style="display:flex; align-items:center; gap:16px;"><span class="badge blue">1</span> <span style="font-size:1.3em;"><strong>Agent Architecture</strong> — Components, data flow, tools, decision logic</span></div>
+      <div style="display:flex; align-items:center; gap:16px;"><span class="badge green">2</span> <span style="font-size:1.3em;"><strong>Demo</strong> — Generated outputs and pipeline execution</span></div>
+      <div style="display:flex; align-items:center; gap:16px;"><span class="badge orange">3</span> <span style="font-size:1.3em;"><strong>Key Challenges</strong> — Technical issues, false positives, limitations</span></div>
+      <div style="display:flex; align-items:center; gap:16px;"><span class="badge red">4</span> <span style="font-size:1.3em;"><strong>Guardrails &amp; Safety</strong> — Anti-hallucination, validation, HITL</span></div>
+      <div style="display:flex; align-items:center; gap:16px;"><span class="badge blue">5</span> <span style="font-size:1.3em;"><strong>Cost &amp; Efficiency</strong> — Compute cost, runtime, trade-offs</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 3: SECTION — Architecture -->
+<!-- ============================================================ -->
+<div class="slide section-slide" id="s3">
+  <div class="section-num">01</div>
+  <h1>Agent Architecture</h1>
+  <p>Components, data flow, tools, and decision-making logic</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 4: TWO-PASS ARCHITECTURE -->
+<!-- ============================================================ -->
+<div class="slide" id="s4">
+  <h2>Two-Pass Architecture</h2>
+  <div class="two-col">
+    <div class="card">
+      <h3><span class="accent">Pass 1:</span> Zeek Sweep</h3>
+      <ul>
+        <li>Covers <strong>all 9 days</strong></li>
+        <li>Downloads only Zeek structured logs (11 datasets/day)</li>
+        <li>Runs 4 agents on lightweight parsed data</li>
+        <li>Flags suspicious days for drill-down</li>
+        <li>Fast — mostly I/O-bound (~30 min total)</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="highlight">Pass 2:</span> PCAP Drill-Down</h3>
+      <ul>
+        <li>Only <strong>flagged days</strong> (typically 3–5 of 9)</li>
+        <li>Downloads 1 PCAP per day (1–5 GB each)</li>
+        <li>Full tshark-based deep analysis</li>
+        <li>File extraction &amp; artifact inspection</li>
+        <li>Packet-level confirmation (~1–2 hrs/day)</li>
+      </ul>
+    </div>
+  </div>
+  <div style="margin-top: 24px; text-align: center;">
+    <p><strong>Why two passes?</strong> Single-pass: 50+ GB disk, 12+ hours &nbsp;→&nbsp; Two-pass: <span class="accent">4.5 GB peak</span>, <span class="accent">~6 hours</span></p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 5: DATA FLOW -->
+<!-- ============================================================ -->
+<div class="slide" id="s5">
+  <h2>Data Flow</h2>
+  <div class="diagram">
+    <div class="diagram-row">
+      <div class="d-box blue">SC4063 API</div>
+      <div class="d-arrow">→</div>
+      <div class="d-box">Alerts<br><small>Suricata</small></div>
+      <div class="d-arrow">→</div>
+      <div class="d-box orange">Score &amp; Rank</div>
+    </div>
+    <div class="d-arrow" style="transform: rotate(90deg);">→</div>
+    <div class="diagram-row">
+      <div class="d-box blue">Zeek Logs</div>
+      <div class="d-arrow">→</div>
+      <div class="d-box">ECS → Zeek<br><small>ecs_compat.py</small></div>
+      <div class="d-arrow">→</div>
+      <div class="d-box green" style="min-width: 280px;">4 Agents (PipelineState)<br><small>IA · LM · Exfil · Payload</small></div>
+    </div>
+    <div class="d-arrow" style="transform: rotate(90deg);">→</div>
+    <div class="diagram-row">
+      <div class="d-box orange">MITRE ATT&amp;CK<br><small>835 techniques</small></div>
+      <div class="d-arrow">→</div>
+      <div class="d-box green">Report Writer<br><small>GPT-4o-mini</small></div>
+      <div class="d-arrow">→</div>
+      <div class="d-box" style="border-color: #7ee787; color: #7ee787;">📄 MD + PDF<br><small>Incident Report</small></div>
+    </div>
+  </div>
+  <p style="text-align:center; margin-top: 12px; color: #8b949e;">Attack context accumulates <strong>chronologically</strong> — Day N+1 agents receive all findings from Days 1 through N</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 6: THE FIVE AGENTS -->
+<!-- ============================================================ -->
+<div class="slide" id="s6">
+  <h2>The Five Agents</h2>
+  <div class="scroll-content">
+    <table>
+      <tr>
+        <th>Agent</th>
+        <th>Purpose</th>
+        <th>Pass</th>
+        <th>Method</th>
+        <th>Key Outputs</th>
+      </tr>
+      <tr>
+        <td><strong class="accent">Initial Access</strong></td>
+        <td>How did the attacker get in?</td>
+        <td>1 + 2</td>
+        <td>Zeek triage (P1), LLM ReAct 30 steps (P2)</td>
+        <td>Patient zero, attacker IP, attack vector</td>
+      </tr>
+      <tr>
+        <td><strong class="accent">Lateral Movement</strong></td>
+        <td>How did they spread?</td>
+        <td>1</td>
+        <td>LLM ReAct, 5 Zeek tools, 8 steps</td>
+        <td>Compromised hosts, movement paths, techniques</td>
+      </tr>
+      <tr>
+        <td><strong class="accent">Exfiltration</strong></td>
+        <td>Was data stolen?</td>
+        <td>1</td>
+        <td>3 detection modules + LLM summariser</td>
+        <td>Detected flag, destinations, protocols, confidence</td>
+      </tr>
+      <tr>
+        <td><strong class="accent">Payload</strong></td>
+        <td>How was ransomware deployed?</td>
+        <td>1 + 2</td>
+        <td>LLM ReAct, 4 Zeek + 4 PCAP tools</td>
+        <td>Deployment method, suspicious files, target hosts</td>
+      </tr>
+      <tr>
+        <td><strong class="accent">Report Writer</strong></td>
+        <td>Synthesise all findings</td>
+        <td>Final</td>
+        <td>Single LLM call, 16K tokens</td>
+        <td>Structured MD + PDF report</td>
+      </tr>
+    </table>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 7: TOOLS INVENTORY -->
+<!-- ============================================================ -->
+<div class="slide" id="s7">
+  <h2>Tools Available to Agents</h2>
+  <div class="scroll-content">
+    <div class="two-col">
+      <div>
+        <h3>Initial Access (6 tools)</h3>
+        <ul>
+          <li><code>pcap_overview</code> — Capture metadata</li>
+          <li><code>tcp_conversations</code> — Sessions by bytes</li>
+          <li><code>packet_query</code> — Custom tshark filters</li>
+          <li><code>group_count</code> — Packet counts by field</li>
+          <li><code>protocol_hierarchy</code> — Protocol distribution</li>
+          <li><code>ip_conversations</code> — IP pair summary</li>
+        </ul>
+        <h3 style="margin-top: 18px;">Lateral Movement (5 tools)</h3>
+        <ul>
+          <li><code>smb_lateral_movement</code> — Admin share, PsExec</li>
+          <li><code>rdp_lateral_movement</code> — Internal RDP</li>
+          <li><code>ntlm_auth_events</code> — Pass-the-hash</li>
+          <li><code>kerberos_events</code> — Kerberoasting</li>
+          <li><code>dce_rpc_events</code> — SCM, WMI, SAMR</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Exfiltration (3 modules)</h3>
+        <ul>
+          <li><code>exfiltration_tool</code> — Volume spikes, beaconing</li>
+          <li><code>dns_exfiltration</code> — DNS tunnelling</li>
+          <li><code>http_exfiltration</code> — HTTP POST uploads</li>
+        </ul>
+        <h3 style="margin-top: 18px;">Payload (8 tools)</h3>
+        <ul>
+          <li><code>smb_file_drops</code> — Executable writes via SMB</li>
+          <li><code>rdp_from_dc</code> — RDP from domain controller</li>
+          <li><code>remote_execution_events</code> — WinRM, WMI</li>
+          <li><code>http_payload_downloads</code> — Suspicious downloads</li>
+          <li><code>extract_http_objects</code> — File extraction (P2)</li>
+          <li><code>extract_smb_objects</code> — SMB extraction (P2)</li>
+          <li><code>inspect_file</code> — SHA256, entropy, magic (P2)</li>
+          <li><code>search_pcap_for_pattern</code> — Custom filter (P2)</li>
+        </ul>
+      </div>
+    </div>
+    <p style="margin-top: 14px; color: #8b949e; text-align: center;"><strong>25 unique tools</strong> across all agents &nbsp;·&nbsp; All tool outputs capped at 12K–15K chars for LLM context</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 8: DECISION-MAKING LOGIC -->
+<!-- ============================================================ -->
+<div class="slide" id="s8">
+  <h2>Decision-Making Logic</h2>
+  <div class="two-col">
+    <div>
+      <h3>Supervisor: Deterministic Routing</h3>
+      <div class="flow-row" style="flex-direction: column; align-items: flex-start; gap: 6px; margin-top: 12px;">
+        <div class="flow-box active-box">① Initial Access</div>
+        <span class="flow-arrow" style="margin-left: 55px;">↓</span>
+        <div class="flow-box active-box">② Lateral Movement</div>
+        <span class="flow-arrow" style="margin-left: 55px;">↓</span>
+        <div class="flow-box active-box">③ Exfiltration</div>
+        <span class="flow-arrow" style="margin-left: 55px;">↓</span>
+        <div class="flow-box active-box">④ Payload</div>
+        <span class="flow-arrow" style="margin-left: 55px;">↓</span>
+        <div class="flow-box" style="border-color: #ffa657; color: #ffa657;">MITRE → Report</div>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.95em; color: #8b949e;">Fixed order for reliability &amp; cost control. <br>No LLM-based routing decisions.</p>
+    </div>
+    <div>
+      <h3>Drill-Down Decision (Rule-Based)</h3>
+      <p style="margin-top: 12px;">A day is flagged for PCAP if <strong>ANY</strong>:</p>
+      <ul>
+        <li>Successful RDP session &gt; <code>10 KB</code></li>
+        <li>Brute-force count &gt; <code>1,000</code></li>
+        <li>Lateral movement detected</li>
+        <li>Exfiltration detected</li>
+        <li>Alert count &gt; <code>50</code> on that day</li>
+      </ul>
+      <h3 style="margin-top: 20px;">Agent Step Limits</h3>
+      <ul>
+        <li>Initial Access: <strong>30 steps</strong></li>
+        <li>Lateral Movement: <strong>8 steps</strong></li>
+        <li>Payload (Zeek): <strong>8 steps</strong></li>
+        <li>Payload (+ PCAP): <strong>15 steps</strong></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 9: SECTION — Demo -->
+<!-- ============================================================ -->
+<div class="slide section-slide" id="s9">
+  <div class="section-num">02</div>
+  <h1>Demo</h1>
+  <p>Generated outputs and pipeline execution</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 10: DEMO — Report Structure -->
+<!-- ============================================================ -->
+<div class="slide" id="s10">
+  <h2>Generated Report Structure</h2>
+  <div class="two-col">
+    <div>
+      <h3>Report Sections</h3>
+      <ol style="font-size: 1.05em;">
+        <li>Title / Cover Page</li>
+        <li>Table of Contents</li>
+        <li><strong>Executive Summary</strong> <span style="color:#8b949e;">(C-suite)</span></li>
+        <li><strong>Detailed Findings</strong> <span style="color:#8b949e;">(MITRE-mapped)</span></li>
+        <li><strong>Conclusion &amp; Recommendations</strong> <span style="color:#8b949e;">(H/M/L)</span></li>
+        <li>Appendix — Timeline</li>
+        <li>Appendix — Technical Details</li>
+        <li>Evidence Gaps</li>
+        <li>Evidence Provenance</li>
+      </ol>
+    </div>
+    <div>
+      <h3>Output Formats</h3>
+      <div class="card" style="margin-top: 8px;">
+        <p>📄 <code>combined_incident_report.md</code></p>
+        <p>📑 <code>combined_incident_report.pdf</code></p>
+        <p style="color:#8b949e; font-size: 0.9em; margin-top: 8px;">ReportLab Platypus · A4 · Professional styling</p>
+      </div>
+      <h3 style="margin-top: 18px;">Key Features</h3>
+      <ul>
+        <li>Every claim cites <strong>evidence</strong> (5-tuples, timestamps)</li>
+        <li>MITRE technique IDs in every finding</li>
+        <li>Threat group attribution with overlap scores</li>
+        <li>"Insufficient evidence" for unknowns</li>
+        <li>Full provenance audit trail</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 11: DEMO — Pipeline Execution -->
+<!-- ============================================================ -->
+<div class="slide" id="s11">
+  <h2>Pipeline Execution Flow</h2>
+  <div style="background: #0d1117; border: 1px solid #30363d; border-radius: 10px; padding: 24px; font-family: 'Cascadia Code', monospace; font-size: 0.82em; line-height: 1.7; overflow-y: auto; max-height: 65vh;">
+    <span style="color:#8b949e;">$ python master_pipeline.py --all-days --work-dir data</span><br><br>
+    <span style="color:#58a6ff;">═══════════════════════════════════════════</span><br>
+    <span style="color:#e6edf3;">  SC4063 Security Analysis Pipeline — ALL DAYS</span><br>
+    <span style="color:#58a6ff;">═══════════════════════════════════════════</span><br><br>
+    <span style="color:#7ee787;">  Phase 2: Scoring alerts across 9 days</span><br>
+    <span style="color:#c9d1d9;">  Top suspect IPs:</span><br>
+    <span style="color:#c9d1d9;">    185.220.101.x &nbsp;&nbsp; score=12847 &nbsp;(856 alerts)</span><br>
+    <span style="color:#c9d1d9;">    92.255.85.x &nbsp;&nbsp;&nbsp;&nbsp; score=8234 &nbsp;&nbsp;(542 alerts)</span><br><br>
+    <span style="color:#ffa657;">  Pass 1: Zeek Sweep — analysing 9 days (no PCAPs)</span><br>
+    <span style="color:#c9d1d9;">  [1/9] 2025-03-06: Zeek sweep</span><br>
+    <span style="color:#c9d1d9;">  &nbsp;&nbsp;[IA triage] 4,832 external RDP attempts from 12 unique IPs</span><br>
+    <span style="color:#c9d1d9;">  &nbsp;&nbsp;[LM] Running lateral movement agent…</span><br>
+    <span style="color:#c9d1d9;">  &nbsp;&nbsp;[Exfil] Running exfiltration agent…</span><br>
+    <span style="color:#7ee787;">  &nbsp;&nbsp;[→ PCAP drill-down needed: successful RDP session (245,832 bytes)]</span><br><br>
+    <span style="color:#c9d1d9;">  [2/9] 2025-03-07: Zeek sweep</span><br>
+    <span style="color:#8b949e;">  &nbsp;&nbsp;[→ No PCAP drill-down needed: no significant findings]</span><br><br>
+    <span style="color:#ffa657;">  Pass 2: PCAP Drill-down — 4 days</span><br>
+    <span style="color:#c9d1d9;">  [1/4] 2025-03-06: PCAP drill-down</span><br>
+    <span style="color:#c9d1d9;">  &nbsp;&nbsp;[IA] Running initial access with PCAP… (30 steps)</span><br>
+    <span style="color:#c9d1d9;">  &nbsp;&nbsp;[Payload] Running payload agent…</span><br><br>
+    <span style="color:#7ee787;">  ✓ Combined report generated (14,832 chars)</span><br>
+    <span style="color:#7ee787;">  ✓ PDF → reports/a3f8c2d1/combined_incident_report.pdf</span><br>
+    <span style="color:#58a6ff;">═══════════════════════════════════════════</span><br>
+    <span style="color:#e6edf3;">  All-days pipeline complete in 22,140s (~6.2 hrs)</span><br>
+    <span style="color:#58a6ff;">═══════════════════════════════════════════</span>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 12: SECTION — Challenges -->
+<!-- ============================================================ -->
+<div class="slide section-slide" id="s12">
+  <div class="section-num">03</div>
+  <h1>Key Challenges</h1>
+  <p>Technical challenges, false positives, tool limitations, scaling</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 13: TECHNICAL CHALLENGES -->
+<!-- ============================================================ -->
+<div class="slide" id="s13">
+  <h2>Technical Challenges</h2>
+  <div class="scroll-content">
+    <div class="two-col">
+      <div class="card">
+        <h3><span class="warn">ECS Field Mismatch</span></h3>
+        <p>API returns Elastic Common Schema format (<code>source.ip</code>) but tools expect Zeek format (<code>id.orig_h</code>)</p>
+        <p style="color:#7ee787; margin-top: 8px;">✓ <code>ecs_compat.py</code> auto-translates 40+ fields across 12 log types — transparent to all agents</p>
+      </div>
+      <div class="card">
+        <h3><span class="warn">Google Drive Quota</span></h3>
+        <p>Public links hit per-file quota limits; downloads fail mid-pipeline</p>
+        <p style="color:#7ee787; margin-top: 8px;">✓ "Quota latch" — first failure permanently switches to authenticated Drive API, saving ~30 min of retries</p>
+      </div>
+      <div class="card">
+        <h3><span class="warn">Large PCAP Analysis</span></h3>
+        <p>1–5 GB PCAPs cause tshark queries to take 1–2 minutes each</p>
+        <p style="color:#7ee787; margin-top: 8px;">✓ Pre-filter by port in display filters; PCAP-only on flagged days; 120–300s timeouts with fallback</p>
+      </div>
+      <div class="card">
+        <h3><span class="warn">Multi-Day Correlation</span></h3>
+        <p>Attack spans 9 days; Patient Zero on Day 1 must influence Day 5 analysis</p>
+        <p style="color:#7ee787; margin-top: 8px;">✓ Rolling attack context propagates chronologically; findings accumulate across days</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 14: FALSE POSITIVES & DETECTION GAPS -->
+<!-- ============================================================ -->
+<div class="slide" id="s14">
+  <h2>False Positives &amp; Detection Gaps</h2>
+  <div class="scroll-content">
+    <table>
+      <tr>
+        <th>Area</th>
+        <th>Challenge</th>
+        <th>Mitigation</th>
+      </tr>
+      <tr>
+        <td><strong>DNS Tunnelling</strong></td>
+        <td>C2 beaconing mimics tunnelling (high query rate + entropy)</td>
+        <td>Conservative thresholds: entropy &gt; 3.5 bits/char, label &gt; 40 chars, rate &gt; 200/5min; require multiple indicators</td>
+      </tr>
+      <tr>
+        <td><strong>Exfil Volume</strong></td>
+        <td>Legitimate backup/sync generates large outbound volumes</td>
+        <td>CDN/service port filtering; beaconing CV coefficient check</td>
+      </tr>
+      <tr>
+        <td><strong>Lateral Movement</strong></td>
+        <td>Encrypted RDP/SMB hides operation details in Zeek logs</td>
+        <td>Fall back to tshark packet inspection in Pass 2</td>
+      </tr>
+      <tr>
+        <td><strong>Missing Data</strong></td>
+        <td>Not all 11 Zeek datasets available on every day</td>
+        <td>Graceful degradation; provenance logs record gaps</td>
+      </tr>
+      <tr>
+        <td><strong>LLM Hallucination</strong></td>
+        <td>LLM can invent IPs/domains not in evidence</td>
+        <td>Post-generation grounding check; hallucination risk scoring</td>
+      </tr>
+    </table>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 15: TOOL LIMITATIONS & SCALING -->
+<!-- ============================================================ -->
+<div class="slide" id="s15">
+  <h2>Tool Limitations &amp; Scaling</h2>
+  <div class="two-col">
+    <div>
+      <h3>Limitations</h3>
+      <ul>
+        <li><strong>tshark timeouts</strong> — Complex queries on large PCAPs exceed 300s; simplified fallback queries used</li>
+        <li><strong>LLM step exhaustion</strong> — 30-step IA ReAct loop may not cover all leads; forced best-effort report</li>
+        <li><strong>Disk constraints</strong> — 5 GB soft limit; large Zeek datasets may temporarily exceed it</li>
+        <li><strong>No encrypted payload inspection</strong> — Cannot analyse encrypted file transfers</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Scaling Characteristics</h3>
+      <ul>
+        <li><strong>Runtime scales linearly</strong> with days (~40 min/day Zeek sweep)</li>
+        <li><strong>CPU-light</strong> — ~6% peak; network-bound (80% of time)</li>
+        <li><strong>RAM-light</strong> — ~200 MB peak</li>
+        <li><strong>Disk-managed</strong> — Sliding window keeps ≤4.5 GB</li>
+        <li><strong>Checkpoint/resume</strong> — Crash-resilient; resumes from last completed day</li>
+      </ul>
+      <div class="card" style="margin-top: 16px;">
+        <p style="text-align:center;">9 days → <strong class="accent">~6 hours</strong><br>
+        <span style="color:#8b949e;">vs. 12+ hours single-pass</span></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 16: SECTION — Guardrails -->
+<!-- ============================================================ -->
+<div class="slide section-slide" id="s16">
+  <div class="section-num">04</div>
+  <h1>Guardrails &amp; Safety Controls</h1>
+  <p>Anti-hallucination, validation, constraints, human-in-the-loop</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 17: ANTI-HALLUCINATION -->
+<!-- ============================================================ -->
+<div class="slide" id="s17">
+  <h2>Anti-Hallucination: 5 Layers</h2>
+  <div class="scroll-content">
+    <div class="three-col">
+      <div class="card">
+        <h3>1. Evidence-Only Prompts</h3>
+        <p>"Never fabricate packet IDs, hashes, users, hosts, ATT&amp;CK IDs, or timestamps"</p>
+        <p style="margin-top: 8px;">"Write <em>Insufficient evidence</em> rather than guessing"</p>
+      </div>
+      <div class="card">
+        <h3>2. Low Temperature</h3>
+        <p>All LLM calls use <code>temperature = 0.0 – 0.1</code></p>
+        <p style="margin-top: 8px;">Maximises determinism and factual output</p>
+      </div>
+      <div class="card">
+        <h3>3. Grounding Check</h3>
+        <p>Post-generation verification:</p>
+        <ol style="font-size: 0.9em;">
+          <li>Extract IPs &amp; domains from LLM output</li>
+          <li>Extract entities from source evidence</li>
+          <li>Verify every mention exists in evidence</li>
+          <li>Score: 0.0 → 1.0 grounding</li>
+        </ol>
+      </div>
+    </div>
+    <div class="two-col" style="margin-top: 16px;">
+      <div class="card">
+        <h3>4. Structured Schemas</h3>
+        <p>Agents return fixed JSON fields — no room for free-form hallucination. E.g.: <code>{"summary", "deployment_method", "payload_files", "source_host", "target_hosts"}</code></p>
+      </div>
+      <div class="card">
+        <h3>5. Deterministic MITRE</h3>
+        <p>ATT&amp;CK technique matching uses <strong>keyword lookup</strong> against static database, not LLM inference. The LLM cannot fabricate technique IDs.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 18: AGENT CONSTRAINTS & VALIDATION -->
+<!-- ============================================================ -->
+<div class="slide" id="s18">
+  <h2>Agent Constraints &amp; Validation</h2>
+  <div class="two-col">
+    <div>
+      <h3>Constraints</h3>
+      <ul>
+        <li><strong>Step limits</strong> — 8 to 30 steps per agent; prevents runaway loops and cost</li>
+        <li><strong>Token budgets</strong> — Tool outputs capped at 12K–15K chars; report at 16K tokens</li>
+        <li><strong>Deterministic routing</strong> — Fixed agent order eliminates orchestrator hallucination</li>
+        <li><strong>Mandatory checklists</strong> — IA agent must address 8-point checklist before report submission</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Validation Steps</h3>
+      <ul>
+        <li><strong>IOC deduplication</strong> — <code>merge_all_iocs()</code> across all agents</li>
+        <li><strong>RFC1918 verification</strong> — Compromised hosts must be internal IPs</li>
+        <li><strong>MITRE threshold</strong> — Threat groups need ≥2 overlapping techniques</li>
+        <li><strong>Magic number checks</strong> — Extracted files verified (PE, 7-Zip, ZIP)</li>
+        <li><strong>Entropy threshold</strong> — Suspicious files &gt; 7.0 entropy</li>
+        <li><strong>Evidence citations</strong> — Every claim must reference data</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 19: HUMAN-IN-THE-LOOP -->
+<!-- ============================================================ -->
+<div class="slide" id="s19">
+  <h2>Human-in-the-Loop Considerations</h2>
+  <div class="three-col">
+    <div class="card">
+      <h3><span class="accent">Interactive Mode</span></h3>
+      <p>Terminal attached: prompt user to select PCAP when multiple candidates exist</p>
+      <p style="margin-top: 8px; color: #8b949e;">User picks best PCAP per day, or accepts auto-selection</p>
+    </div>
+    <div class="card">
+      <h3><span class="highlight">Non-Interactive</span></h3>
+      <p>CI/CD or background: auto-selects best PCAP by alert score</p>
+      <p style="margin-top: 8px; color: #8b949e;">Generous drill-down thresholds — errs on side of investigation</p>
+    </div>
+    <div class="card">
+      <h3><span class="warn">Debug Mode</span></h3>
+      <p><code>--only lateral_movement</code></p>
+      <p style="margin-top: 8px; color: #8b949e;">Run single agent for targeted investigation without full pipeline</p>
+    </div>
+  </div>
+  <div class="card" style="margin-top: 20px;">
+    <h3>Provenance Audit Trail</h3>
+    <p>Full record of which files each agent accessed per day — enables post-hoc human review of the pipeline's evidence basis. Appended to every generated report.</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 20: SECTION — Cost -->
+<!-- ============================================================ -->
+<div class="slide section-slide" id="s20">
+  <div class="section-num">05</div>
+  <h1>Cost &amp; Efficiency</h1>
+  <p>Compute cost, time to complete, trade-offs</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 21: COST & TIMING -->
+<!-- ============================================================ -->
+<div class="slide" id="s21">
+  <h2>Cost &amp; Timing Breakdown</h2>
+  <div class="two-col">
+    <div>
+      <h3>Estimated LLM API Cost (9-day run)</h3>
+      <table>
+        <tr><th>Component</th><th>Calls</th><th>Est. Cost</th></tr>
+        <tr><td>Pass 1 agents (9 days)</td><td>50–80</td><td>$0.50–$1.00</td></tr>
+        <tr><td>Pass 2 agents (3–5 days)</td><td>90–250</td><td>$1.00–$3.00</td></tr>
+        <tr><td>Report writer</td><td>1</td><td>$0.10–$0.20</td></tr>
+        <tr><td><strong>Total</strong></td><td></td><td><strong class="accent">~$2–$5</strong></td></tr>
+      </table>
+      <p style="margin-top: 12px; font-size: 0.9em; color: #8b949e;">Model: Azure OpenAI <strong>GPT-4o-mini</strong><br>
+      $0.15/M input tokens · $0.60/M output tokens</p>
+    </div>
+    <div>
+      <h3>Time to Complete</h3>
+      <table>
+        <tr><th>Phase</th><th>Duration</th><th>Bottleneck</th></tr>
+        <tr><td>Alert scoring</td><td>~5 min</td><td>Network</td></tr>
+        <tr><td>Pass 1 (9 days)</td><td>~30 min</td><td>Zeek download</td></tr>
+        <tr><td>Pass 2 (3–5 days)</td><td>~1–2 hrs/day</td><td>PCAP download</td></tr>
+        <tr><td>Report generation</td><td>~2 min</td><td>LLM inference</td></tr>
+        <tr><td><strong>Total</strong></td><td><strong class="accent">~4–6 hours</strong></td><td><strong>80% network</strong></td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 22: RESOURCE USAGE & TRADE-OFFS -->
+<!-- ============================================================ -->
+<div class="slide" id="s22">
+  <h2>Resource Usage &amp; Trade-offs</h2>
+  <div class="two-col">
+    <div>
+      <h3>Resource Footprint</h3>
+      <table>
+        <tr><th>Resource</th><th>Usage</th></tr>
+        <tr><td>CPU</td><td>~6% peak</td></tr>
+        <tr><td>RAM</td><td>~200 MB peak</td></tr>
+        <tr><td>Disk</td><td>4.5 GB peak (sliding window)</td></tr>
+        <tr><td>Network</td><td>~10 MB/s via Google Drive API</td></tr>
+      </table>
+      <p style="margin-top: 12px; color: #8b949e;">Pipeline is <strong>network-bound</strong>, not compute-bound.</p>
+    </div>
+    <div>
+      <h3>Key Trade-offs</h3>
+      <div class="card" style="margin-bottom: 12px;">
+        <p><strong class="accent">Speed vs. Coverage</strong></p>
+        <p>Two-pass: Full 9-day coverage in 6 hrs<br>Single-pass: 12+ hrs, 50+ GB disk</p>
+      </div>
+      <div class="card" style="margin-bottom: 12px;">
+        <p><strong class="highlight">Accuracy vs. Cost</strong></p>
+        <p>Higher step limits → more thorough but more API calls. Current: balanced at 8–30 steps/agent.</p>
+      </div>
+      <div class="card">
+        <p><strong>Determinism vs. Flexibility</strong></p>
+        <p>Fixed routing eliminates hallucination risk at supervisor level; LLM flexibility within each agent.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 23: SUMMARY -->
+<!-- ============================================================ -->
+<div class="slide" id="s23">
+  <h2>Key Takeaways</h2>
+  <div style="margin-top: 20px;">
+    <ul style="font-size: 1.2em; line-height: 2;">
+      <li><span class="accent">✓</span> <strong>Autonomous PCAP analysis</strong> — ingests raw network data, produces structured incident report</li>
+      <li><span class="accent">✓</span> <strong>Two-pass architecture</strong> — full Zeek sweep, targeted PCAP drill-down (4.5 GB peak, ~6 hrs)</li>
+      <li><span class="accent">✓</span> <strong>25 specialised tools</strong> across 4 agents — tshark, Zeek, file extraction, pattern matching</li>
+      <li><span class="accent">✓</span> <strong>5-layer anti-hallucination</strong> — prompts, temperature, grounding check, schemas, deterministic MITRE</li>
+      <li><span class="accent">✓</span> <strong>Cost-effective</strong> — ~$2–5 per 9-day run with GPT-4o-mini</li>
+      <li><span class="accent">✓</span> <strong>Full auditability</strong> — provenance tracking, checkpoints, evidence citations</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SLIDE 24: QUESTIONS -->
+<!-- ============================================================ -->
+<div class="slide title-slide" id="s24">
+  <h1>Questions?</h1>
+  <div class="subtitle">Thank you</div>
+  <div class="meta">
+    SC4063 Agentic Network Forensic Analysis Pipeline<br>
+    <code style="font-size: 0.9em;">python master_pipeline.py --all-days --work-dir data</code>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- ── Navigation ─────────────────────────────────────────────── -->
+<div class="slide-num" id="slideNum">1 / 24</div>
+<div class="progress" id="progress" style="width: 4.17%;"></div>
+<div class="nav">
+  <button onclick="prev()" id="btnPrev">← Prev</button>
+  <button onclick="next()" id="btnNext">Next →</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let current = 0;
+
+function show(n) {
+  if (n < 0 || n >= slides.length) return;
+  slides[current].classList.remove('active');
+  current = n;
+  slides[current].classList.add('active');
+  document.getElementById('slideNum').textContent = `${current + 1} / ${slides.length}`;
+  document.getElementById('progress').style.width = `${((current + 1) / slides.length) * 100}%`;
+}
+
+function next() { show(current + 1); }
+function prev() { show(current - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); show(0); }
+  if (e.key === 'End') { e.preventDefault(); show(slides.length - 1); }
+});
+
+/* Touch swipe support */
+let touchStartX = 0;
+document.addEventListener('touchstart', e => { touchStartX = e.changedTouches[0].screenX; });
+document.addEventListener('touchend', e => {
+  const diff = e.changedTouches[0].screenX - touchStartX;
+  if (Math.abs(diff) > 50) { diff < 0 ? next() : prev(); }
+});
+</script>
+</body>
+</html>
